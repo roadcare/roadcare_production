@@ -66,11 +66,11 @@ class MapMatcher:
         SELECT DISTINCT 
             s.id as session_id,
             s.geom_calib,
-            ST_Length(s.geom) as session_length
+            ST_Length(s.geom) as session_length,
+            s.acquisition_date
         FROM public.session s
         JOIN public.image i ON i.session_id = s.id
         WHERE s.geom_calib IS NOT NULL
-        AND s.state != 'processed'  -- Adjust based on your state management
         ORDER BY s.acquisition_date DESC
         """
         
