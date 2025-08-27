@@ -461,6 +461,7 @@ class MapMatcher:
             perpendicular_iterations: Number of times to run step8 (default: 2)
         """
         logger.info(f"Starting map-matching process (SQL algorithm implementation)")
+        logger.info(f"Database: {self.db_config['database']}")
         logger.info(f"Buffer radius: {self.buffer_radius}m")
         logger.info(f"Min segment length: {self.min_segment_length}m")
         logger.info(f"Perpendicular iterations: {perpendicular_iterations}")
@@ -499,19 +500,20 @@ class MapMatcher:
             self.disconnect()
 
 
-def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0):
+def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0, database: str = 'cd08_demo'):
     """Main function to run the map-matching program
     
     Args:
         perpendicular_iterations: Number of times to run perpendicular handling (default: 2)
         buffer_radius: Buffer radius in meters for segment matching (default: 24.0)
         min_segment_length: Minimum valid projected segment length in meters (default: 50.0)
+        database: Database name (default: 'cd08_demo')
     """
     
     # Database configuration
     db_config = {
         'host': 'localhost',          # Update with your host
-        'database': 'cd08_demo',     # Update with your database name
+        'database': database,         # Configurable database name
         'user': 'diagway',           # Update with your username
         'password': 'diagway',       # Update with your password
         'port': 5433                  # Update with your port
@@ -523,6 +525,7 @@ def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_seg
     try:
         results = matcher.run(perpendicular_iterations)
         print(f"\n=== Map-matching Results ===")
+        print(f"Database: {database}")
         print(f"Buffer radius: {buffer_radius}m")
         print(f"Min segment length: {min_segment_length}m")
         print(f"Perpendicular iterations: {perpendicular_iterations}")
@@ -571,6 +574,13 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
+        '-d', '--database',
+        type=str,
+        default='cd08_demo',
+        help='Database name to connect to'
+    )
+    
+    parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose logging (DEBUG level)'
@@ -589,16 +599,20 @@ if __name__ == "__main__":
     if args.min_segment_length <= 0:
         parser.error("min_segment_length must be > 0")
     
+    if not args.database.strip():
+        parser.error("database name cannot be empty")
+    
     # Set logging level based on verbose flag
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Verbose logging enabled")
     
     print(f"Starting map-matching with:")
+    print(f"  - Database: {args.database}")
     print(f"  - Perpendicular iterations: {args.perpendicular_iterations}")
     print(f"  - Buffer radius: {args.buffer_radius}m")
     print(f"  - Min segment length: {args.min_segment_length}m")
     print(f"  - Verbose logging: {'enabled' if args.verbose else 'disabled'}")
     print()
     
-    exit(main(args.perpendicular_iterations, args.buffer_radius, args.min_segment_length))
+    exit(main(args.perpendicular_iterations, args.buffer_radius, args.min_segment_length, args.database))
