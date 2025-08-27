@@ -3,6 +3,8 @@
 Road Network Linear Referencing Calibration Script
 Transforms MultiLineString geometries to LineStringM (measured) for linear referencing
 with ratio adjustment to match longueur field values
+
+Final Version - Updated with id_tronc structure
 """
 
 import psycopg2
@@ -73,7 +75,7 @@ class RoadCalibrator:
                 CREATE TABLE IF NOT EXISTS client.troncon_client (
                     id SERIAL PRIMARY KEY,
                     axe VARCHAR,  -- Keep original axe name from route_client
-                    seg_num INTEGER,  -- Segment number for MultiLineString parts
+                    id_tronc TEXT,  -- Segment identifier (axe + segment number)
                     geom_calib GEOMETRY(LINESTRINGM, 2154),
                     cumuld DECIMAL,  -- Start measure adjusted by ratio
                     cumulf DECIMAL,  -- End measure adjusted by ratio
@@ -100,14 +102,14 @@ class RoadCalibrator:
                 ON client.troncon_client (cumulf);
                 """)
                 
-                # Create index on axe and seg_num
+                # Create index on axe and id_tronc
                 cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_troncon_client_axe_seg 
-                ON client.troncon_client (axe, seg_num);
+                CREATE INDEX IF NOT EXISTS idx_troncon_client_axe_tronc 
+                ON client.troncon_client (axe, id_tronc);
                 """)
                 
                 self.connection.commit()
-                logger.info("Table client.troncon_client created/verified successfully with simplified structure")
+                logger.info("Table client.troncon_client created/verified successfully with id_tronc structure")
                 return True
                 
         except psycopg2.Error as e:
@@ -201,10 +203,10 @@ class RoadCalibrator:
             with self.connection.cursor() as cursor:
                 calibration_sql = """
                 INSERT INTO client.troncon_client 
-                (axe, seg_num, geom_calib, cumuld, cumulf)
+                (axe, id_tronc, geom_calib, cumuld, cumulf)
                 SELECT 
                     %(axe)s,
-                    1 as seg_num,  -- Single segment
+                    %(axe)s || '_1' as id_tronc,  -- Single segment gets _1
                     ST_AddMeasure(
                         CASE 
                             WHEN ST_GeometryType(%(geom)s) = 'ST_MultiLineString' THEN
@@ -271,10 +273,10 @@ class RoadCalibrator:
                     # Insert calibrated segment with both geometric and adjusted measures
                     part_calibration_sql = """
                     INSERT INTO client.troncon_client 
-                    (axe, seg_num, geom_calib, cumuld, cumulf)
+                    (axe, id_tronc, geom_calib, cumuld, cumulf)
                     SELECT 
                         %(axe)s,  -- Keep original axe name
-                        %(part_num)s as seg_num,  -- Segment number
+                        %(axe)s || '_' || %(part_num)s::text as id_tronc,  -- axe + segment number
                         ST_AddMeasure(
                             ST_GeometryN(%(geom)s, %(part_num)s),
                             %(geometric_start)s,
@@ -298,6 +300,7 @@ class RoadCalibrator:
                     cumulative_adjusted_measure = adjusted_end
                     
                     logger.debug(f"Calibrated segment {part_num}/{num_parts} of route {route['axe']}: "
+                               f"id_tronc={route['axe']}_{part_num}, "
                                f"geometric: {geometric_start:.2f}-{geometric_end:.2f}, "
                                f"adjusted: {adjusted_start:.2f}-{adjusted_end:.2f}")
                 
@@ -365,10 +368,10 @@ class RoadCalibrator:
                 cursor.execute("""
                 SELECT 
                     COUNT(*) as total,
-                    COUNT(CASE WHEN cumuld = 0 AND seg_num = 1 THEN 1 END) as routes_start_zero,
+                    COUNT(CASE WHEN cumuld = 0 AND id_tronc LIKE '%_1' THEN 1 END) as routes_start_zero,
                     AVG(cumulf) as avg_end_measure
                 FROM client.troncon_client
-                WHERE seg_num = 1;  -- Only first segments
+                WHERE id_tronc LIKE '%_1';  -- Only first segments
                 """)
                 
                 stats = cursor.fetchone()
@@ -394,8 +397,7 @@ class RoadCalibrator:
                 SELECT 
                     COUNT(*) as total_segments,
                     COUNT(DISTINCT axe) as total_routes,
-                    MIN(seg_num) as min_seg_num,
-                    MAX(seg_num) as max_seg_num,
+                    COUNT(DISTINCT SUBSTRING(id_tronc FROM '^(.*)_[0-9]+$')) as total_routes_from_tronc,
                     MIN(cumuld) as min_start_measure,
                     MAX(cumulf) as max_end_measure,
                     AVG(cumulf - cumuld) as avg_segment_length
@@ -478,7 +480,6 @@ def main():
             logger.info("Calibration Summary:")
             logger.info(f"  Total segments: {summary['total_segments']}")
             logger.info(f"  Total routes: {summary['total_routes']}")
-            logger.info(f"  Segment numbers range: {summary['min_seg_num']} - {summary['max_seg_num']}")
             logger.info(f"  Average segment length: {summary['avg_segment_length']:.2f}")
             logger.info(f"  Measure range: {summary['min_start_measure']:.2f} - {summary['max_end_measure']:.2f}")
             logger.info(f"  Correctly calibrated routes: {summary['correctly_calibrated_routes']}/{summary['total_routes_checked']}")
