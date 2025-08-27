@@ -17,16 +17,18 @@ logger = logging.getLogger(__name__)
 class MapMatcher:
     """Main class for map-matching operations following the SQL algorithm"""
     
-    def __init__(self, db_config: Dict[str, str], buffer_radius: float = 24.0):
+    def __init__(self, db_config: Dict[str, str], buffer_radius: float = 24.0, min_segment_length: float = 50.0):
         """
         Initialize MapMatcher
         
         Args:
             db_config: Database connection parameters
             buffer_radius: Buffer radius in meters for segment matching (default 24m as in SQL)
+            min_segment_length: Minimum valid projected segment length in meters (default 50m)
         """
         self.db_config = db_config
         self.buffer_radius = buffer_radius
+        self.min_segment_length = min_segment_length
         self.conn = None
         
     def connect(self):
@@ -137,15 +139,14 @@ class MapMatcher:
             cur.execute("UPDATE traitement.projection_paire SET d_angle = 0.0 WHERE d_angle IS NULL")
             
             # Set valid pairs based on criteria
-            cur.execute("""
+            cur.execute(f"""
                 UPDATE traitement.projection_paire 
                 SET is_paire = true 
-                WHERE (len_ss_on_client >= 0.2*len_ss OR len_client_sur_ss >= 0.2*len_client)
-                AND NOT (
+                WHERE NOT (
                     (CASE 
                         WHEN abs(d_angle) BETWEEN 0 AND 180 THEN d_angle
                         WHEN abs(d_angle) BETWEEN 180 AND 360 THEN d_angle - 180
-                    END BETWEEN 45 AND 135 AND (len_ss < 200 OR len_client < 200))
+                    END BETWEEN 45 AND 135 AND (len_ss < {self.min_segment_length} OR len_client < {self.min_segment_length}))
                     OR len_client_sur_ss = 0.0 
                     OR len_ss_on_client = 0.0
                 )
@@ -463,6 +464,7 @@ class MapMatcher:
         """
         logger.info(f"Starting map-matching process (SQL algorithm implementation)")
         logger.info(f"Buffer radius: {self.buffer_radius}m")
+        logger.info(f"Min segment length: {self.min_segment_length}m")
         logger.info(f"Perpendicular iterations: {perpendicular_iterations}")
         
         try:
@@ -499,12 +501,13 @@ class MapMatcher:
             self.disconnect()
 
 
-def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0):
+def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0):
     """Main function to run the map-matching program
     
     Args:
         perpendicular_iterations: Number of times to run perpendicular handling (default: 2)
         buffer_radius: Buffer radius in meters for segment matching (default: 24.0)
+        min_segment_length: Minimum valid projected segment length in meters (default: 50.0)
     """
     
     # Database configuration
@@ -517,12 +520,13 @@ def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0):
     }
     
     # Create and run map matcher
-    matcher = MapMatcher(db_config, buffer_radius)
+    matcher = MapMatcher(db_config, buffer_radius, min_segment_length)
     
     try:
         results = matcher.run(perpendicular_iterations)
         print(f"\n=== Map-matching Results ===")
         print(f"Buffer radius: {buffer_radius}m")
+        print(f"Min segment length: {min_segment_length}m")
         print(f"Perpendicular iterations: {perpendicular_iterations}")
         print(f"Total images: {results['total_images']}")
         print(f"Successfully matched: {results['matched_images']}")
@@ -562,6 +566,13 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
+        '-s', '--min-segment-length',
+        type=float,
+        default=50.0,
+        help='Minimum valid projected segment length in meters'
+    )
+    
+    parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose logging (DEBUG level)'
@@ -577,6 +588,9 @@ if __name__ == "__main__":
     if args.buffer_radius <= 0:
         parser.error("buffer_radius must be > 0")
     
+    if args.min_segment_length <= 0:
+        parser.error("min_segment_length must be > 0")
+    
     # Set logging level based on verbose flag
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -585,7 +599,8 @@ if __name__ == "__main__":
     print(f"Starting map-matching with:")
     print(f"  - Perpendicular iterations: {args.perpendicular_iterations}")
     print(f"  - Buffer radius: {args.buffer_radius}m")
+    print(f"  - Min segment length: {args.min_segment_length}m")
     print(f"  - Verbose logging: {'enabled' if args.verbose else 'disabled'}")
     print()
     
-    exit(main(args.perpendicular_iterations, args.buffer_radius))
+    exit(main(args.perpendicular_iterations, args.buffer_radius, args.min_segment_length))
