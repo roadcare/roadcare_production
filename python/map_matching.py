@@ -77,28 +77,28 @@ class MapMatcher:
             cur.execute("DROP TABLE IF EXISTS traitement.projection_paire")
         
         # Create projection_paire table
-        query = """
+        query = f"""
         CREATE TABLE traitement.projection_paire AS
         SELECT 
             t1.id as session_id, 
             t2.id_tronc,
-            ST_Length(ST_Intersection(ST_Buffer(t2.geom_calib,24,'endcap=flat join=bevel'),t1.geom)) as len_ss_on_client, 
+            ST_Length(ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom)) as len_ss_on_client, 
             ST_Length(t1.geom) as len_ss,
-            ST_Length(ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,24,'endcap=flat join=bevel'))) as len_client_sur_ss,
+            ST_Length(ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))) as len_client_sur_ss,
             ST_Length(t2.geom_calib) as len_client,
-            ST_Intersection(ST_Buffer(t2.geom_calib,24,'endcap=flat join=bevel'),t1.geom) as geom_ss_sur_client,
-            ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,24,'endcap=flat join=bevel')) as geom_client_sur_session,
+            ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom) as geom_ss_sur_client,
+            ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel')) as geom_client_sur_session,
             degrees(st_angle(
-                ST_Intersection(ST_Buffer(t2.geom_calib,24,'endcap=flat join=bevel'),t1.geom),
-                ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,24,'endcap=flat join=bevel'))
+                ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom),
+                ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))
             )) as angle_client_ss,
-            ST_Intersection(ST_Buffer(t2.geom_calib,24,'endcap=flat join=bevel'),ST_Buffer(t1.geom,24)) as geom_intersect
+            ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),ST_Buffer(t1.geom,{self.buffer_radius})) as geom_intersect
         FROM public.session t1 
-        JOIN client.troncon_client t2 ON ST_Distance(t2.geom_calib,t1.geom) < 25
+        JOIN client.troncon_client t2 ON ST_Distance(t2.geom_calib,t1.geom) < {self.buffer_radius + 1}
         AND (
-            ST_Intersects(ST_Buffer(t2.geom_calib,24,'endcap=flat join=bevel'), t1.geom)
+            ST_Intersects(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'), t1.geom)
             OR 
-            ST_Intersects(t2.geom_calib, ST_Buffer(t1.geom,24,'endcap=flat join=bevel'))
+            ST_Intersects(t2.geom_calib, ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))
         )
         """
         
@@ -179,7 +179,10 @@ class MapMatcher:
         with self.conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS traitement.projection_img_dist")
             
-            query = """
+            # Use a smaller buffer for images (5m or 1/5 of the main buffer)
+            image_buffer = min(5.0, self.buffer_radius / 5.0)
+            
+            query = f"""
             CREATE TABLE traitement.projection_img_dist AS     
             SELECT 
                 t1.id, 
@@ -189,12 +192,12 @@ class MapMatcher:
             JOIN traitement.projection_paire t2 ON 
                 t2.is_paire IS TRUE 
                 AND t1.session_id = t2.session_id 
-                AND ST_Within(t1.geom, ST_Buffer(t2.geom_ss_sur_client, 5, 'endcap=flat join=bevel'))
+                AND ST_Within(t1.geom, ST_Buffer(t2.geom_ss_sur_client, {image_buffer}, 'endcap=round join=bevel'))
             """
             
             cur.execute(query)
             records = cur.rowcount
-            logger.info(f"Created projection_img_dist table with {records} image-troncon distances")
+            logger.info(f"Created projection_img_dist table with {records} image-troncon distances (image buffer: {image_buffer}m)")
         
         self.conn.commit()
 
@@ -452,9 +455,15 @@ class MapMatcher:
                 'sessions_processed': sessions_processed
             }
 
-    def run(self) -> Dict[str, int]:
-        """Run the complete map-matching process following SQL algorithm"""
-        logger.info("Starting map-matching process (SQL algorithm implementation)")
+    def run(self, perpendicular_iterations: int = 2) -> Dict[str, int]:
+        """Run the complete map-matching process following SQL algorithm
+        
+        Args:
+            perpendicular_iterations: Number of times to run step8 (default: 2)
+        """
+        logger.info(f"Starting map-matching process (SQL algorithm implementation)")
+        logger.info(f"Buffer radius: {self.buffer_radius}m")
+        logger.info(f"Perpendicular iterations: {perpendicular_iterations}")
         
         try:
             self.connect()
@@ -467,7 +476,12 @@ class MapMatcher:
             self.step5_create_projection_img_dist()
             self.step6_assign_best_troncons()
             self.step7_calculate_projections()
-            self.step8_handle_perpendicular_cases()
+            
+            # Run step8 multiple times as specified
+            for iteration in range(perpendicular_iterations):
+                logger.info(f"Running perpendicular handling iteration {iteration + 1}/{perpendicular_iterations}")
+                self.step8_handle_perpendicular_cases()
+            
             self.step9_final_projections()
             self.step10_update_axe_values()
             
@@ -485,8 +499,13 @@ class MapMatcher:
             self.disconnect()
 
 
-def main():
-    """Main function to run the map-matching program"""
+def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0):
+    """Main function to run the map-matching program
+    
+    Args:
+        perpendicular_iterations: Number of times to run perpendicular handling (default: 2)
+        buffer_radius: Buffer radius in meters for segment matching (default: 24.0)
+    """
     
     # Database configuration
     db_config = {
@@ -497,15 +516,14 @@ def main():
         'port': 5433                  # Update with your port
     }
     
-    # Map-matching parameters (24m buffer as in original SQL)
-    buffer_radius = 24.0  # meters
-    
     # Create and run map matcher
     matcher = MapMatcher(db_config, buffer_radius)
     
     try:
-        results = matcher.run()
+        results = matcher.run(perpendicular_iterations)
         print(f"\n=== Map-matching Results ===")
+        print(f"Buffer radius: {buffer_radius}m")
+        print(f"Perpendicular iterations: {perpendicular_iterations}")
         print(f"Total images: {results['total_images']}")
         print(f"Successfully matched: {results['matched_images']}")
         print(f"Match rate: {results['match_rate_percent']}%")
@@ -521,4 +539,53 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    import argparse
+    
+    # Create argument parser
+    parser = argparse.ArgumentParser(
+        description='Map-matching program for road images to linear referencing system',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        '-i', '--perpendicular-iterations',
+        type=int,
+        default=2,
+        help='Number of times to run perpendicular handling (step8)'
+    )
+    
+    parser.add_argument(
+        '-b', '--buffer-radius',
+        type=float,
+        default=24.0,
+        help='Buffer radius in meters for segment matching'
+    )
+    
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging (DEBUG level)'
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.perpendicular_iterations < 1:
+        parser.error("perpendicular_iterations must be >= 1")
+    
+    if args.buffer_radius <= 0:
+        parser.error("buffer_radius must be > 0")
+    
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose logging enabled")
+    
+    print(f"Starting map-matching with:")
+    print(f"  - Perpendicular iterations: {args.perpendicular_iterations}")
+    print(f"  - Buffer radius: {args.buffer_radius}m")
+    print(f"  - Verbose logging: {'enabled' if args.verbose else 'disabled'}")
+    print()
+    
+    exit(main(args.perpendicular_iterations, args.buffer_radius))
