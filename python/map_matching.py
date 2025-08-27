@@ -146,9 +146,7 @@ class MapMatcher:
                     (CASE 
                         WHEN abs(d_angle) BETWEEN 0 AND 180 THEN d_angle
                         WHEN abs(d_angle) BETWEEN 180 AND 360 THEN d_angle - 180
-                    END BETWEEN 45 AND 135 AND (len_ss < {self.min_segment_length} OR len_client < {self.min_segment_length}))
-                    OR len_client_sur_ss = 0.0 
-                    OR len_ss_on_client = 0.0
+                    END BETWEEN 45 AND 135 OR (len_client_sur_ss < {self.min_segment_length} OR len_ss_on_client < {self.min_segment_length}))
                 )
             """)
             
