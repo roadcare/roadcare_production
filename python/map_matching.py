@@ -164,7 +164,7 @@ class MapMatcher:
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE public.image 
-                SET id_tronc = NULL, axe = NULL, prj_quality = NULL, cumuld_client = NULL
+                SET id_tronc = NULL, axe = NULL, prj_quality = NULL, cumuld = NULL
             """)
             affected_rows = cur.rowcount
             logger.info(f"Reset projection fields for {affected_rows} images")
