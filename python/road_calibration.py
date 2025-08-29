@@ -4,7 +4,13 @@ Road Network Linear Referencing Calibration Script
 Transforms MultiLineString geometries to LineStringM (measured) for linear referencing
 with ratio adjustment to match longueur field values
 
-Final Version - Updated with id_tronc structure
+COMPLETE FINAL VERSION - Includes route-level calibrated geometries
+Features:
+- Creates client.troncon_client with individual calibrated segments
+- Updates client.route_client with geom_calib column (grouped calibrated geometries)
+- Ratio adjustment to match declared route lengths
+- Support for MultiLineString with gaps
+- Comprehensive validation and reporting
 """
 
 import psycopg2
@@ -21,7 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class RoadCalibrator:
-    """Class to handle road network calibration and linear referencing with ratio adjustment"""
+    """
+    Complete road network calibration class for linear referencing
+    Handles both segment-level and route-level calibrated geometries
+    """
     
     def __init__(self, db_config: dict):
         """
@@ -64,7 +73,7 @@ class RoadCalibrator:
     
     def create_troncon_table(self) -> bool:
         """
-        Create the client.troncon_client table if it doesn't exist
+        Create the client.troncon_client table for individual calibrated segments
         
         Returns:
             bool: True if successful, False otherwise
@@ -76,7 +85,7 @@ class RoadCalibrator:
                     id SERIAL PRIMARY KEY,
                     axe VARCHAR,  -- Keep original axe name from route_client
                     id_tronc TEXT,  -- Segment identifier (axe + segment number)
-                    geom_calib GEOMETRY(LINESTRINGM, 2154),
+                    geom_calib GEOMETRY(LINESTRINGM, 2154),  -- Calibrated segment geometry
                     cumuld DECIMAL,  -- Start measure adjusted by ratio
                     cumulf DECIMAL,  -- End measure adjusted by ratio
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -91,7 +100,7 @@ class RoadCalibrator:
                 ON client.troncon_client USING GIST (geom_calib);
                 """)
                 
-                # Create indexes on measure fields
+                # Create indexes on measure fields for performance
                 cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_troncon_client_cumuld 
                 ON client.troncon_client (cumuld);
@@ -102,14 +111,14 @@ class RoadCalibrator:
                 ON client.troncon_client (cumulf);
                 """)
                 
-                # Create index on axe and id_tronc
+                # Create composite index for route and segment queries
                 cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_troncon_client_axe_tronc 
                 ON client.troncon_client (axe, id_tronc);
                 """)
                 
                 self.connection.commit()
-                logger.info("Table client.troncon_client created/verified successfully with id_tronc structure")
+                logger.info("Table client.troncon_client created/verified successfully")
                 return True
                 
         except psycopg2.Error as e:
@@ -120,6 +129,7 @@ class RoadCalibrator:
     def calibrate_routes(self) -> bool:
         """
         Main calibration function: Transform MultiLineString to LineStringM with ratio adjustment
+        Creates individual calibrated segments in client.troncon_client
         
         Returns:
             bool: True if successful, False otherwise
@@ -128,13 +138,13 @@ class RoadCalibrator:
             with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 # Clear existing calibrated data
                 cursor.execute("DELETE FROM client.troncon_client;")
-                logger.info("Cleared existing calibrated data")
+                logger.info("Cleared existing calibrated segment data")
                 
                 # Fetch routes to calibrate
                 select_sql = """
                 SELECT id, axe, longueur, geom
                 FROM client.route_client
-                ORDER BY id;
+                ORDER BY axe;
                 """
                 
                 cursor.execute(select_sql)
@@ -148,7 +158,7 @@ class RoadCalibrator:
                         calibrated_count += 1
                 
                 self.connection.commit()
-                logger.info(f"Successfully calibrated {calibrated_count}/{len(routes)} routes with ratio adjustment")
+                logger.info(f"Successfully calibrated {calibrated_count}/{len(routes)} routes")
                 return True
                 
         except psycopg2.Error as e:
@@ -180,10 +190,10 @@ class RoadCalibrator:
                 geom_info = cursor.fetchone()
                 geom_type, num_parts, total_geometric_length = geom_info
                 
-                # Calculate ratio: longueur_field / real_geometric_length
+                # Calculate ratio: declared_length / actual_geometric_length
                 ratio = float(route['longueur']) / float(total_geometric_length) if total_geometric_length > 0 else 1.0
                 
-                logger.debug(f"Route {route['axe']}: longueur_field={route['longueur']}, "
+                logger.debug(f"Route {route['axe']}: declared_length={route['longueur']}, "
                            f"geometric_length={total_geometric_length:.2f}, ratio={ratio:.6f}")
                 
                 if geom_type == 'ST_MultiLineString' and num_parts > 1:
@@ -198,7 +208,16 @@ class RoadCalibrator:
             return False
     
     def _calibrate_simple_route(self, route: dict, ratio: float) -> bool:
-        """Calibrate a simple single-segment route with ratio adjustment"""
+        """
+        Calibrate a simple single-segment route with ratio adjustment
+        
+        Args:
+            route (dict): Route data from database
+            ratio (float): Adjustment ratio for measures
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
         try:
             with self.connection.cursor() as cursor:
                 calibration_sql = """
@@ -223,7 +242,7 @@ class RoadCalibrator:
                         END   -- Geometric end measure
                     ) as geom_calib,
                     0.0 as cumuld,  -- Adjusted start measure
-                    %(longueur)s as cumulf;  -- Adjusted end measure (should equal longueur field)
+                    %(longueur)s as cumulf;  -- Adjusted end measure (equals declared length)
                 """
                 
                 cursor.execute(calibration_sql, {
@@ -242,10 +261,18 @@ class RoadCalibrator:
         """
         Calibrate MultiLineString route with continuous measures across all segments
         Each segment gets continuous measure values with ratio adjustment
+        
+        Args:
+            route (dict): Route data from database
+            num_parts (int): Number of parts in MultiLineString
+            ratio (float): Adjustment ratio for measures
+            
+        Returns:
+            bool: True if successful, False otherwise
         """
         try:
             with self.connection.cursor() as cursor:
-                # Calculate cumulative measures for each segment (geometric)
+                # Calculate cumulative measures for each segment
                 cumulative_geometric_measure = 0.0
                 cumulative_adjusted_measure = 0.0
                 
@@ -266,11 +293,11 @@ class RoadCalibrator:
                     adjusted_start = cumulative_adjusted_measure
                     adjusted_end = cumulative_adjusted_measure + segment_adjusted_length
                     
-                    # For the last segment, ensure it ends exactly at longueur value
+                    # For the last segment, ensure it ends exactly at declared length
                     if part_num == num_parts:
                         adjusted_end = float(route['longueur'])
                     
-                    # Insert calibrated segment with both geometric and adjusted measures
+                    # Insert calibrated segment
                     part_calibration_sql = """
                     INSERT INTO client.troncon_client 
                     (axe, id_tronc, geom_calib, cumuld, cumulf)
@@ -331,7 +358,7 @@ class RoadCalibrator:
                 
                 logger.info(f"Original routes: {original_count}")
                 logger.info(f"Calibrated routes: {calibrated_routes_count}")
-                logger.info(f"Calibrated segments: {calibrated_segments_count}")
+                logger.info(f"Total calibrated segments: {calibrated_segments_count}")
                 
                 # Validate geometry types
                 cursor.execute("""
@@ -345,7 +372,7 @@ class RoadCalibrator:
                     logger.warning(f"Found {invalid_geom_count} geometries that are not LineStringM")
                     return False
                 
-                # Validate ratio adjustments - check that final cumulf matches longueur for each route
+                # Validate that final cumulf matches longueur for each route
                 cursor.execute("""
                 WITH route_max_cumulf AS (
                     SELECT 
@@ -367,16 +394,16 @@ class RoadCalibrator:
                 # Check measure values
                 cursor.execute("""
                 SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN cumuld = 0 AND id_tronc LIKE '%_1' THEN 1 END) as routes_start_zero,
+                    COUNT(*) as total_first_segments,
+                    COUNT(CASE WHEN cumuld = 0 THEN 1 END) as segments_starting_at_zero,
                     AVG(cumulf) as avg_end_measure
                 FROM client.troncon_client
                 WHERE id_tronc LIKE '%_1';  -- Only first segments
                 """)
                 
                 stats = cursor.fetchone()
-                logger.info(f"Validation - Total first segments: {stats[0]}, Start at 0: {stats[1]}, "
-                          f"Avg end measure: {stats[2]:.2f}")
+                logger.info(f"First segments validation: {stats[0]} total, {stats[1]} start at 0, "
+                          f"avg end measure: {stats[2]:.2f}")
                 
                 return True
                 
@@ -384,35 +411,117 @@ class RoadCalibrator:
             logger.error(f"Validation failed: {e}")
             return False
     
+    def update_route_client_with_calibrated_geom(self) -> bool:
+        """
+        Add geom_calib column to client.route_client and populate it with 
+        grouped geometries from client.troncon_client
+        
+        This creates route-level calibrated geometries by collecting all segments
+        for each route in the correct order.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.connection.cursor() as cursor:
+                # Add the geom_calib column if it doesn't exist
+                logger.info("Adding geom_calib column to client.route_client...")
+                cursor.execute("""
+                DO $$
+                BEGIN
+                    BEGIN
+                        ALTER TABLE client.route_client 
+                        ADD COLUMN geom_calib GEOMETRY(MultiLineStringM, 2154);
+                        RAISE NOTICE 'Column geom_calib added to client.route_client';
+                    EXCEPTION
+                        WHEN duplicate_column THEN 
+                        RAISE NOTICE 'Column geom_calib already exists in client.route_client';
+                    END;
+                END $$;
+                """)
+                
+                # Create spatial index on the new column
+                cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_route_client_geom_calib 
+                ON client.route_client USING GIST (geom_calib);
+                """)
+                
+                # Update route_client with grouped geometries from troncon_client
+                logger.info("Updating client.route_client with grouped calibrated geometries...")
+                update_sql = """
+                UPDATE client.route_client rc
+                SET geom_calib = grouped_geom.multi_geom_calib
+                FROM (
+                    SELECT 
+                        axe,
+                        ST_Collect(
+                            geom_calib 
+                            ORDER BY CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)
+                        )::GEOMETRY(MultiLineStringM, 2154) as multi_geom_calib
+                    FROM client.troncon_client
+                    GROUP BY axe
+                ) grouped_geom
+                WHERE rc.axe = grouped_geom.axe;
+                """
+                
+                cursor.execute(update_sql)
+                rows_updated = cursor.rowcount
+                
+                self.connection.commit()
+                logger.info(f"Successfully updated {rows_updated} routes with grouped calibrated geometries")
+                
+                # Verify the update
+                cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_routes,
+                    COUNT(CASE WHEN geom_calib IS NOT NULL THEN 1 END) as routes_with_calib_geom,
+                    COUNT(CASE WHEN ST_GeometryType(geom_calib) = 'ST_MultiLineStringM' THEN 1 END) as routes_with_correct_type
+                FROM client.route_client;
+                """)
+                
+                verification = cursor.fetchone()
+                logger.info(f"Route-level verification - Total: {verification[0]}, "
+                          f"With calibrated geom: {verification[1]}, "
+                          f"Correct geometry type: {verification[2]}")
+                
+                return True
+                
+        except psycopg2.Error as e:
+            logger.error(f"Failed to update route_client with calibrated geometries: {e}")
+            self.connection.rollback()
+            return False
+    
     def get_calibration_summary(self) -> Optional[dict]:
         """
-        Get summary statistics of the calibration process including ratio adjustments
+        Get comprehensive summary statistics of the calibration process
         
         Returns:
             dict: Summary statistics or None if error
         """
         try:
             with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Segment-level statistics
                 cursor.execute("""
                 SELECT 
                     COUNT(*) as total_segments,
                     COUNT(DISTINCT axe) as total_routes,
-                    COUNT(DISTINCT SUBSTRING(id_tronc FROM '^(.*)_[0-9]+$')) as total_routes_from_tronc,
                     MIN(cumuld) as min_start_measure,
                     MAX(cumulf) as max_end_measure,
-                    AVG(cumulf - cumuld) as avg_segment_length
+                    AVG(cumulf - cumuld) as avg_segment_length,
+                    MIN(CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)) as min_segment_num,
+                    MAX(CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)) as max_segment_num
                 FROM client.troncon_client;
                 """)
                 
                 summary = dict(cursor.fetchone())
                 
-                # Add validation of ratio correctness
+                # Calibration accuracy validation
                 cursor.execute("""
                 WITH route_validation AS (
                     SELECT 
                         tc.axe,
                         MAX(tc.cumulf) as final_cumulf,
-                        rc.longueur as original_longueur,
+                        rc.longueur as declared_longueur,
                         ABS(MAX(tc.cumulf) - rc.longueur) as difference
                     FROM client.troncon_client tc
                     JOIN client.route_client rc ON tc.axe = rc.axe
@@ -421,14 +530,25 @@ class RoadCalibrator:
                 SELECT 
                     COUNT(*) as total_routes_checked,
                     COUNT(CASE WHEN difference < 0.01 THEN 1 END) as correctly_calibrated_routes,
-                    AVG(difference) as avg_difference
+                    AVG(difference) as avg_calibration_difference,
+                    MAX(difference) as max_calibration_difference
                 FROM route_validation;
                 """)
                 
                 validation = cursor.fetchone()
-                summary['correctly_calibrated_routes'] = validation['correctly_calibrated_routes']
-                summary['total_routes_checked'] = validation['total_routes_checked']
-                summary['avg_difference'] = validation['avg_difference']
+                summary.update(dict(validation))
+                
+                # Route-level calibrated geometry statistics
+                cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_routes_in_route_client,
+                    COUNT(CASE WHEN geom_calib IS NOT NULL THEN 1 END) as routes_with_grouped_geom,
+                    COUNT(CASE WHEN ST_GeometryType(geom_calib) = 'ST_MultiLineStringM' THEN 1 END) as routes_with_correct_geom_type
+                FROM client.route_client;
+                """)
+                
+                route_stats = cursor.fetchone()
+                summary.update(dict(route_stats))
                 
                 return summary
                 
@@ -438,57 +558,88 @@ class RoadCalibrator:
 
 
 def main():
-    """Main execution function"""
+    """
+    Main execution function
+    Orchestrates the complete calibration process
+    """
     
-    # Database configuration
+    # Database configuration for cd08_demo
     db_config = {
-        'host': 'localhost',          # Update with your host
-        'database': 'cd08_demo',     # Update with your database name
-        'user': 'diagway',           # Update with your username
-        'password': 'diagway',  # Update with your password
-        'port': 5433                  # Update with your port
+        'host': 'localhost',
+        'database': 'cd08_demo',
+        'user': 'diagway',
+        'password': 'diagway',
+        'port': 5433
     }
     
     # Initialize calibrator
     calibrator = RoadCalibrator(db_config)
     
     try:
-        # Connect to database
+        logger.info("🚀 Starting Road Network Linear Referencing Calibration")
+        logger.info("=" * 60)
+        
+        # Step 1: Connect to database
         if not calibrator.connect():
             logger.error("Failed to connect to database. Exiting.")
             sys.exit(1)
         
-        # Create target table
+        # Step 2: Create target table for segments
+        logger.info("📋 Creating/verifying segment table...")
         if not calibrator.create_troncon_table():
             logger.error("Failed to create target table. Exiting.")
             sys.exit(1)
         
-        # Perform calibration
-        logger.info("Starting route calibration with ratio adjustment...")
+        # Step 3: Perform route calibration (create segments)
+        logger.info("⚙️  Starting route calibration with ratio adjustment...")
         if not calibrator.calibrate_routes():
             logger.error("Calibration failed. Exiting.")
             sys.exit(1)
         
-        # Validate results
-        logger.info("Validating calibration results...")
+        # Step 4: Validate calibration results
+        logger.info("✅ Validating calibration results...")
         if not calibrator.validate_calibration():
             logger.warning("Validation found issues, but calibration completed")
         
-        # Get summary
-        summary = calibrator.get_calibration_summary()
-        if summary:
-            logger.info("Calibration Summary:")
-            logger.info(f"  Total segments: {summary['total_segments']}")
-            logger.info(f"  Total routes: {summary['total_routes']}")
-            logger.info(f"  Average segment length: {summary['avg_segment_length']:.2f}")
-            logger.info(f"  Measure range: {summary['min_start_measure']:.2f} - {summary['max_end_measure']:.2f}")
-            logger.info(f"  Correctly calibrated routes: {summary['correctly_calibrated_routes']}/{summary['total_routes_checked']}")
-            logger.info(f"  Average calibration difference: {summary['avg_difference']:.6f}")
+        # Step 5: Update route_client with grouped calibrated geometries
+        logger.info("📊 Creating route-level calibrated geometries...")
+        if not calibrator.update_route_client_with_calibrated_geom():
+            logger.error("Failed to update route_client with calibrated geometries")
+            sys.exit(1)
         
-        logger.info("Road network calibration with ratio adjustment completed successfully!")
+        # Step 6: Generate final summary report
+        logger.info("📈 Generating final summary...")
+        summary = calibrator.get_calibration_summary()
+        
+        if summary:
+            logger.info("=" * 60)
+            logger.info("🎉 FINAL CALIBRATION SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"📦 SEGMENT LEVEL (client.troncon_client):")
+            logger.info(f"   • Total segments created: {summary['total_segments']}")
+            logger.info(f"   • Routes processed: {summary['total_routes']}")
+            logger.info(f"   • Segment range: {summary['min_segment_num']} to {summary['max_segment_num']}")
+            logger.info(f"   • Average segment length: {summary['avg_segment_length']:.2f}m")
+            logger.info(f"   • Measure range: {summary['min_start_measure']:.2f} to {summary['max_end_measure']:.2f}m")
+            
+            logger.info(f"📏 CALIBRATION ACCURACY:")
+            logger.info(f"   • Correctly calibrated routes: {summary['correctly_calibrated_routes']}/{summary['total_routes_checked']}")
+            logger.info(f"   • Average difference: {summary['avg_calibration_difference']:.6f}m")
+            logger.info(f"   • Maximum difference: {summary['max_calibration_difference']:.6f}m")
+            
+            logger.info(f"🛣️  ROUTE LEVEL (client.route_client.geom_calib):")
+            logger.info(f"   • Routes with grouped geometries: {summary['routes_with_grouped_geom']}/{summary['total_routes_in_route_client']}")
+            logger.info(f"   • Correct geometry types: {summary['routes_with_correct_geom_type']}")
+        
+        logger.info("=" * 60)
+        logger.info("🎉 SUCCESS! Road network calibration completed!")
+        logger.info("📊 Both segment-level and route-level calibrations are ready")
+        logger.info("🔧 Use client.troncon_client for detailed segment analysis")  
+        logger.info("🗺️  Use client.route_client.geom_calib for route-level referencing")
+        logger.info("=" * 60)
         
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"💥 Unexpected error: {e}")
         sys.exit(1)
         
     finally:

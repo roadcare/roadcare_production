@@ -1,650 +1,618 @@
 #!/usr/bin/env python3
 """
-Road Network Linear Referencing Calibration Script
-Transforms MultiLineString geometries to LineStringM (measured) for linear referencing
-with ratio adjustment to match longueur field values
-
-COMPLETE FINAL VERSION - Includes route-level calibrated geometries
-Features:
-- Creates client.troncon_client with individual calibrated segments
-- Updates client.route_client with geom_calib column (grouped calibrated geometries)
-- Ratio adjustment to match declared route lengths
-- Support for MultiLineString with gaps
-- Comprehensive validation and reporting
+Map-matching program for road images to linear referencing system
+Based on the SQL algorithm provided - implements the exact same logic
 """
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg2.extras
 import logging
-from typing import Optional
-import sys
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class RoadCalibrator:
-    """
-    Complete road network calibration class for linear referencing
-    Handles both segment-level and route-level calibrated geometries
-    """
+class MapMatcher:
+    """Main class for map-matching operations following the SQL algorithm"""
     
-    def __init__(self, db_config: dict):
+    def __init__(self, db_config: Dict[str, str], buffer_radius: float = 24.0, min_segment_length: float = 50.0):
         """
-        Initialize the RoadCalibrator with database configuration
+        Initialize MapMatcher
         
         Args:
-            db_config (dict): Database connection parameters
+            db_config: Database connection parameters
+            buffer_radius: Buffer radius in meters for segment matching (default 24m as in SQL)
+            min_segment_length: Minimum valid projected segment length in meters (default 50m)
         """
         self.db_config = db_config
-        self.connection = None
-    
-    def connect(self) -> bool:
-        """
-        Establish connection to PostgreSQL/PostGIS database
+        self.buffer_radius = buffer_radius
+        self.min_segment_length = min_segment_length
+        self.conn = None
         
-        Returns:
-            bool: True if connection successful, False otherwise
-        """
+    def connect(self):
+        """Establish database connection"""
         try:
-            self.connection = psycopg2.connect(**self.db_config)
-            logger.info("Successfully connected to database")
-            
-            # Verify PostGIS extension
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT PostGIS_Version();")
-                postgis_version = cursor.fetchone()[0]
-                logger.info(f"PostGIS Version: {postgis_version}")
-            
-            return True
-            
-        except psycopg2.Error as e:
+            self.conn = psycopg2.connect(**self.db_config)
+            self.conn.autocommit = False
+            logger.info("Database connection established")
+        except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
-            return False
+            raise
     
     def disconnect(self):
         """Close database connection"""
-        if self.connection:
-            self.connection.close()
+        if self.conn:
+            self.conn.close()
             logger.info("Database connection closed")
-    
-    def create_troncon_table(self) -> bool:
-        """
-        Create the client.troncon_client table for individual calibrated segments
+
+    def step1_update_seg_ss(self):
+        """Step 1: Update seg_ss for all images (±1m segments from session)"""
+        logger.info("Step 1: Updating seg_ss for all images")
         
-        Returns:
-            bool: True if successful, False otherwise
+        query = """
+        UPDATE public.image t1 
+        SET seg_ss = ST_Force2D(
+            st_geometryN(
+                ST_LocateBetween(t2.geom_calib, t1.cumuld_session-1.0, t1.cumuld_session+1.0), 1
+            )
+        )
+        FROM public.session t2 
+        WHERE t1.session_id = t2.id
         """
-        try:
-            with self.connection.cursor() as cursor:
-                create_table_sql = """
-                CREATE TABLE IF NOT EXISTS client.troncon_client (
-                    id SERIAL PRIMARY KEY,
-                    axe VARCHAR,  -- Keep original axe name from route_client
-                    id_tronc TEXT,  -- Segment identifier (axe + segment number)
-                    geom_calib GEOMETRY(LINESTRINGM, 2154),  -- Calibrated segment geometry
-                    cumuld DECIMAL,  -- Start measure adjusted by ratio
-                    cumulf DECIMAL,  -- End measure adjusted by ratio
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-                
-                cursor.execute(create_table_sql)
-                
-                # Create spatial index
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_troncon_client_geom 
-                ON client.troncon_client USING GIST (geom_calib);
-                """)
-                
-                # Create indexes on measure fields for performance
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_troncon_client_cumuld 
-                ON client.troncon_client (cumuld);
-                """)
-                
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_troncon_client_cumulf 
-                ON client.troncon_client (cumulf);
-                """)
-                
-                # Create composite index for route and segment queries
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_troncon_client_axe_tronc 
-                ON client.troncon_client (axe, id_tronc);
-                """)
-                
-                self.connection.commit()
-                logger.info("Table client.troncon_client created/verified successfully")
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to create troncon table: {e}")
-            self.connection.rollback()
-            return False
-    
-    def calibrate_routes(self) -> bool:
-        """
-        Main calibration function: Transform MultiLineString to LineStringM with ratio adjustment
-        Creates individual calibrated segments in client.troncon_client
         
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Clear existing calibrated data
-                cursor.execute("DELETE FROM client.troncon_client;")
-                logger.info("Cleared existing calibrated segment data")
-                
-                # Fetch routes to calibrate
-                select_sql = """
-                SELECT id, axe, longueur, geom
-                FROM client.route_client
-                ORDER BY axe;
-                """
-                
-                cursor.execute(select_sql)
-                routes = cursor.fetchall()
-                logger.info(f"Found {len(routes)} routes to calibrate")
-                
-                calibrated_count = 0
-                
-                for route in routes:
-                    if self._calibrate_single_route(route):
-                        calibrated_count += 1
-                
-                self.connection.commit()
-                logger.info(f"Successfully calibrated {calibrated_count}/{len(routes)} routes")
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed during route calibration: {e}")
-            self.connection.rollback()
-            return False
-    
-    def _calibrate_single_route(self, route: dict) -> bool:
-        """
-        Calibrate a single route geometry, handling MultiLineString with gaps
-        Maintains continuous measure values across all segments with ratio adjustment
+        with self.conn.cursor() as cur:
+            cur.execute(query)
+            affected_rows = cur.rowcount
+            logger.info(f"Updated seg_ss for {affected_rows} images")
         
-        Args:
-            route (dict): Route data from database
+        self.conn.commit()
+
+    def step2_create_schema_and_projection_paire(self):
+        """Step 2: Create projection_paire table with session-troncon matching"""
+        logger.info("Step 2: Creating projection_paire table")
+        
+        # Create schema
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE SCHEMA IF NOT EXISTS traitement")
+            cur.execute("DROP TABLE IF EXISTS traitement.projection_paire")
+        
+        # Create projection_paire table
+        query = f"""
+        CREATE TABLE traitement.projection_paire AS
+        SELECT 
+            t1.id as session_id, 
+            t2.id_tronc,
+            ST_Length(ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom)) as len_ss_on_client, 
+            ST_Length(t1.geom) as len_ss,
+            ST_Length(ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))) as len_client_sur_ss,
+            ST_Length(t2.geom_calib) as len_client,
+            ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom) as geom_ss_sur_client,
+            ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel')) as geom_client_sur_session,
+            degrees(st_angle(
+                ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),t1.geom),
+                ST_Intersection(t2.geom_calib,ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))
+            )) as angle_client_ss,
+            ST_Intersection(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'),ST_Buffer(t1.geom,{self.buffer_radius})) as geom_intersect
+        FROM public.session t1 
+        JOIN client.troncon_client t2 ON ST_Distance(t2.geom_calib,t1.geom) < {self.buffer_radius + 1}
+        AND (
+            ST_Intersects(ST_Buffer(t2.geom_calib,{self.buffer_radius},'endcap=flat join=bevel'), t1.geom)
+            OR 
+            ST_Intersects(t2.geom_calib, ST_Buffer(t1.geom,{self.buffer_radius},'endcap=flat join=bevel'))
+        )
+        """
+        
+        with self.conn.cursor() as cur:
+            cur.execute(query)
             
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.connection.cursor() as cursor:
-                # Get geometry information and calculate total geometric length
-                cursor.execute("""
-                SELECT 
-                    ST_GeometryType(%(geom)s) as geom_type,
-                    ST_NumGeometries(%(geom)s) as num_parts,
-                    ST_Length(%(geom)s) as total_geometric_length
-                """, {'geom': route['geom']})
-                
-                geom_info = cursor.fetchone()
-                geom_type, num_parts, total_geometric_length = geom_info
-                
-                # Calculate ratio: declared_length / actual_geometric_length
-                ratio = float(route['longueur']) / float(total_geometric_length) if total_geometric_length > 0 else 1.0
-                
-                logger.debug(f"Route {route['axe']}: declared_length={route['longueur']}, "
-                           f"geometric_length={total_geometric_length:.2f}, ratio={ratio:.6f}")
-                
-                if geom_type == 'ST_MultiLineString' and num_parts > 1:
-                    # Handle MultiLineString with multiple segments
-                    return self._calibrate_multilinestring_route(route, num_parts, ratio)
-                else:
-                    # Handle single LineString or single-part MultiLineString
-                    return self._calibrate_simple_route(route, ratio)
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to calibrate route {route['id']}: {e}")
-            return False
-    
-    def _calibrate_simple_route(self, route: dict, ratio: float) -> bool:
-        """
-        Calibrate a simple single-segment route with ratio adjustment
-        
-        Args:
-            route (dict): Route data from database
-            ratio (float): Adjustment ratio for measures
+            # Add columns and constraints
+            cur.execute("ALTER TABLE traitement.projection_paire ADD COLUMN id SERIAL")
+            cur.execute("ALTER TABLE traitement.projection_paire ADD COLUMN is_paire BOOLEAN")
+            cur.execute("ALTER TABLE traitement.projection_paire ADD COLUMN d_angle NUMERIC")
+            cur.execute("UPDATE traitement.projection_paire SET d_angle = degrees(ST_Angle(geom_ss_sur_client,geom_client_sur_session))")
+            cur.execute("ALTER TABLE traitement.projection_paire ADD PRIMARY KEY (id)")
             
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.connection.cursor() as cursor:
-                calibration_sql = """
-                INSERT INTO client.troncon_client 
-                (axe, id_tronc, geom_calib, cumuld, cumulf)
-                SELECT 
-                    %(axe)s,
-                    %(axe)s || '_1' as id_tronc,  -- Single segment gets _1
-                    ST_AddMeasure(
-                        CASE 
-                            WHEN ST_GeometryType(%(geom)s) = 'ST_MultiLineString' THEN
-                                ST_GeometryN(%(geom)s, 1)
-                            ELSE 
-                                %(geom)s
-                        END,
-                        0.0,  -- Geometric start measure
-                        CASE 
-                            WHEN ST_GeometryType(%(geom)s) = 'ST_MultiLineString' THEN
-                                ST_Length(ST_GeometryN(%(geom)s, 1))
-                            ELSE 
-                                ST_Length(%(geom)s)
-                        END   -- Geometric end measure
-                    ) as geom_calib,
-                    0.0 as cumuld,  -- Adjusted start measure
-                    %(longueur)s as cumulf;  -- Adjusted end measure (equals declared length)
-                """
-                
-                cursor.execute(calibration_sql, {
-                    'axe': route['axe'],
-                    'longueur': route['longueur'],
-                    'geom': route['geom']
-                })
-                
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to calibrate simple route {route['id']}: {e}")
-            return False
-    
-    def _calibrate_multilinestring_route(self, route: dict, num_parts: int, ratio: float) -> bool:
-        """
-        Calibrate MultiLineString route with continuous measures across all segments
-        Each segment gets continuous measure values with ratio adjustment
+            logger.info(f"Created projection_paire table with {cur.rowcount} records")
         
-        Args:
-            route (dict): Route data from database
-            num_parts (int): Number of parts in MultiLineString
-            ratio (float): Adjustment ratio for measures
+        self.conn.commit()
+
+    def step3_determine_valid_pairs(self):
+        """Step 3: Determine which session-troncon pairs are valid"""
+        logger.info("Step 3: Determining valid session-troncon pairs")
+        
+        with self.conn.cursor() as cur:
+            # Initialize is_paire to false
+            cur.execute("UPDATE traitement.projection_paire SET is_paire = false")
             
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.connection.cursor() as cursor:
-                # Calculate cumulative measures for each segment
-                cumulative_geometric_measure = 0.0
-                cumulative_adjusted_measure = 0.0
-                
-                for part_num in range(1, num_parts + 1):
-                    # Get segment length
-                    cursor.execute("""
-                    SELECT ST_Length(ST_GeometryN(%(geom)s, %(part_num)s)) as segment_length
-                    """, {'geom': route['geom'], 'part_num': part_num})
-                    
-                    segment_geometric_length = cursor.fetchone()[0]
-                    segment_adjusted_length = segment_geometric_length * ratio
-                    
-                    # Geometric measures (for ST_AddMeasure)
-                    geometric_start = cumulative_geometric_measure
-                    geometric_end = cumulative_geometric_measure + segment_geometric_length
-                    
-                    # Adjusted measures (for cumuld/cumulf fields)
-                    adjusted_start = cumulative_adjusted_measure
-                    adjusted_end = cumulative_adjusted_measure + segment_adjusted_length
-                    
-                    # For the last segment, ensure it ends exactly at declared length
-                    if part_num == num_parts:
-                        adjusted_end = float(route['longueur'])
-                    
-                    # Insert calibrated segment
-                    part_calibration_sql = """
-                    INSERT INTO client.troncon_client 
-                    (axe, id_tronc, geom_calib, cumuld, cumulf)
-                    SELECT 
-                        %(axe)s,  -- Keep original axe name
-                        %(axe)s || '_' || %(part_num)s::text as id_tronc,  -- axe + segment number
-                        ST_AddMeasure(
-                            ST_GeometryN(%(geom)s, %(part_num)s),
-                            %(geometric_start)s,
-                            %(geometric_end)s
-                        ) as geom_calib,
-                        %(adjusted_start)s as cumuld,
-                        %(adjusted_end)s as cumulf;
-                    """
-                    
-                    cursor.execute(part_calibration_sql, {
-                        'axe': route['axe'],
-                        'part_num': part_num,
-                        'geometric_start': geometric_start,
-                        'geometric_end': geometric_end,
-                        'adjusted_start': adjusted_start,
-                        'adjusted_end': adjusted_end,
-                        'geom': route['geom']
-                    })
-                    
-                    cumulative_geometric_measure = geometric_end
-                    cumulative_adjusted_measure = adjusted_end
-                    
-                    logger.debug(f"Calibrated segment {part_num}/{num_parts} of route {route['axe']}: "
-                               f"id_tronc={route['axe']}_{part_num}, "
-                               f"geometric: {geometric_start:.2f}-{geometric_end:.2f}, "
-                               f"adjusted: {adjusted_start:.2f}-{adjusted_end:.2f}")
-                
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to calibrate MultiLineString route {route['id']}: {e}")
-            return False
-    
-    def validate_calibration(self) -> bool:
-        """
-        Validate the calibration results including ratio adjustments
-        
-        Returns:
-            bool: True if validation passes, False otherwise
-        """
-        try:
-            with self.connection.cursor() as cursor:
-                # Check if all routes were calibrated
-                cursor.execute("SELECT COUNT(*) FROM client.route_client;")
-                original_count = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(DISTINCT axe) FROM client.troncon_client;")
-                calibrated_routes_count = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM client.troncon_client;")
-                calibrated_segments_count = cursor.fetchone()[0]
-                
-                logger.info(f"Original routes: {original_count}")
-                logger.info(f"Calibrated routes: {calibrated_routes_count}")
-                logger.info(f"Total calibrated segments: {calibrated_segments_count}")
-                
-                # Validate geometry types
-                cursor.execute("""
-                SELECT COUNT(*) FROM client.troncon_client 
-                WHERE ST_GeometryType(geom_calib) != 'ST_LineStringM';
-                """)
-                
-                invalid_geom_count = cursor.fetchone()[0]
-                
-                if invalid_geom_count > 0:
-                    logger.warning(f"Found {invalid_geom_count} geometries that are not LineStringM")
-                    return False
-                
-                # Validate that final cumulf matches longueur for each route
-                cursor.execute("""
-                WITH route_max_cumulf AS (
-                    SELECT 
-                        tc.axe,
-                        MAX(tc.cumulf) as max_cumulf
-                    FROM client.troncon_client tc
-                    GROUP BY tc.axe
+            # Normalize angles
+            cur.execute("""
+                UPDATE traitement.projection_paire 
+                SET d_angle = CASE 
+                    WHEN abs(d_angle) BETWEEN 0 AND 180 THEN d_angle
+                    WHEN abs(d_angle) BETWEEN 180 AND 360 THEN d_angle - 180
+                END
+            """)
+            
+            # Handle null angles
+            cur.execute("UPDATE traitement.projection_paire SET d_angle = 0.0 WHERE d_angle IS NULL")
+            
+            # Set valid pairs based on criteria
+            cur.execute(f"""
+                UPDATE traitement.projection_paire 
+                SET is_paire = true 
+                WHERE NOT (
+                    (CASE 
+                        WHEN abs(d_angle) BETWEEN 0 AND 180 THEN d_angle
+                        WHEN abs(d_angle) BETWEEN 180 AND 360 THEN d_angle - 180
+                    END BETWEEN 45 AND 135 OR (len_client_sur_ss < {self.min_segment_length} OR len_ss_on_client < {self.min_segment_length}))
                 )
-                SELECT 
-                    COUNT(*) as total_routes,
-                    COUNT(CASE WHEN ABS(rmc.max_cumulf - rc.longueur) < 0.01 THEN 1 END) as correctly_terminated_routes
-                FROM route_max_cumulf rmc
-                JOIN client.route_client rc ON rmc.axe = rc.axe;
-                """)
-                
-                route_stats = cursor.fetchone()
-                logger.info(f"Routes validation: {route_stats[0]} total, {route_stats[1]} correctly terminated")
-                
-                # Check measure values
-                cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_first_segments,
-                    COUNT(CASE WHEN cumuld = 0 THEN 1 END) as segments_starting_at_zero,
-                    AVG(cumulf) as avg_end_measure
-                FROM client.troncon_client
-                WHERE id_tronc LIKE '%_1';  -- Only first segments
-                """)
-                
-                stats = cursor.fetchone()
-                logger.info(f"First segments validation: {stats[0]} total, {stats[1]} start at 0, "
-                          f"avg end measure: {stats[2]:.2f}")
-                
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Validation failed: {e}")
-            return False
-    
-    def update_route_client_with_calibrated_geom(self) -> bool:
-        """
-        Add geom_calib column to client.route_client and populate it with 
-        grouped geometries from client.troncon_client
+            """)
+            
+            # Count valid pairs
+            cur.execute("SELECT COUNT(*) FROM traitement.projection_paire WHERE is_paire = true")
+            valid_pairs = cur.fetchone()[0]
+            logger.info(f"Found {valid_pairs} valid session-troncon pairs")
         
-        This creates route-level calibrated geometries by collecting all segments
-        for each route in the correct order.
+        self.conn.commit()
+
+    def step4_reset_image_projections(self):
+        """Step 4: Reset image projection fields"""
+        logger.info("Step 4: Resetting image projection fields")
         
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.connection.cursor() as cursor:
-                # Add the geom_calib column if it doesn't exist
-                logger.info("Adding geom_calib column to client.route_client...")
-                cursor.execute("""
-                DO $$
-                BEGIN
-                    BEGIN
-                        ALTER TABLE client.route_client 
-                        ADD COLUMN geom_calib GEOMETRY(MultiLineStringM, 2154);
-                        RAISE NOTICE 'Column geom_calib added to client.route_client';
-                    EXCEPTION
-                        WHEN duplicate_column THEN 
-                        RAISE NOTICE 'Column geom_calib already exists in client.route_client';
-                    END;
-                END $$;
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.image 
+                SET id_tronc = NULL, axe = NULL, prj_quality = NULL, cumuld = NULL
+            """)
+            affected_rows = cur.rowcount
+            logger.info(f"Reset projection fields for {affected_rows} images")
+        
+        self.conn.commit()
+
+    def step5_create_projection_img_dist(self):
+        """Step 5: Create image-distance table for valid pairs"""
+        logger.info("Step 5: Creating projection_img_dist table")
+        
+        with self.conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS traitement.projection_img_dist")
+            
+            # Use a smaller buffer for images (5m or 1/5 of the main buffer)
+            image_buffer = min(5.0, self.buffer_radius / 5.0)
+            
+            query = f"""
+            CREATE TABLE traitement.projection_img_dist AS     
+            SELECT 
+                t1.id, 
+                t2.id_tronc,
+                st_distance(t1.geom, t2.geom_client_sur_session) as dist 
+            FROM public.image t1
+            JOIN traitement.projection_paire t2 ON 
+                t2.is_paire IS TRUE 
+                AND t1.session_id = t2.session_id 
+                AND ST_Within(t1.geom, ST_Buffer(t2.geom_ss_sur_client, {image_buffer}, 'endcap=round join=bevel'))
+            """
+            
+            cur.execute(query)
+            records = cur.rowcount
+            logger.info(f"Created projection_img_dist table with {records} image-troncon distances (image buffer: {image_buffer}m)")
+        
+        self.conn.commit()
+
+    def step6_assign_best_troncons(self):
+        """Step 6: Assign best matching troncon to each image"""
+        logger.info("Step 6: Assigning best matching troncons to images")
+        
+        with self.conn.cursor() as cur:
+            query = """
+            UPDATE public.image t1 
+            SET id_tronc = r1.id_tronc, prj_quality = r1.min_dist
+            FROM (
+                SELECT t1.id, t1.id_tronc, r1.min_dist 
+                FROM traitement.projection_img_dist t1
+                JOIN (
+                    SELECT id, min(dist) as min_dist 
+                    FROM traitement.projection_img_dist 
+                    GROUP BY id
+                ) r1 ON t1.id = r1.id AND t1.dist = r1.min_dist
+            ) r1
+            WHERE t1.id = r1.id
+            """
+            
+            cur.execute(query)
+            affected_rows = cur.rowcount
+            logger.info(f"Assigned troncons to {affected_rows} images")
+        
+        self.conn.commit()
+
+    def step7_calculate_projections(self):
+        """Step 7: Calculate geometric projections and cumulative distances"""
+        logger.info("Step 7: Calculating geometric projections")
+        
+        with self.conn.cursor() as cur:
+            try:
+                # Calculate cumuld and geom_prj
+                logger.info("Step 7a: Calculating cumuld and geom_prj")
+                cur.execute("""
+                    UPDATE public.image point 
+                    SET 
+                        cumuld = ST_M(ST_LineInterpolatePoint(line.geom_calib, ST_LineLocatePoint(line.geom_calib, point.geom))),
+                        geom_prj = ST_Force2D(ST_LineInterpolatePoint(line.geom_calib, ST_LineLocatePoint(line.geom_calib, point.geom)))
+                    FROM client.troncon_client line
+                    WHERE point.id_tronc = line.id_tronc AND point.id_tronc IS NOT NULL
                 """)
+                logger.info(f"Updated cumuld and geom_prj for {cur.rowcount} images")
                 
-                # Create spatial index on the new column
-                cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_route_client_geom_calib 
-                ON client.route_client USING GIST (geom_calib);
+                # Update ln_prj
+                logger.info("Step 7b: Calculating ln_prj")
+                cur.execute("UPDATE public.image SET ln_prj = ST_Force2D(ST_MakeLine(geom, geom_prj)) WHERE geom_prj IS NOT NULL")
+                logger.info(f"Updated ln_prj for {cur.rowcount} images")
+                
+                # Update seg_prj
+                logger.info("Step 7c: Calculating seg_prj")
+                cur.execute("""
+                    UPDATE public.image t1 
+                    SET seg_prj = ST_Force2D(
+                        st_geometryN(
+                            ST_LocateBetween(t2.geom_calib, t1.cumuld-1.0, t1.cumuld+1.0), 1
+                        )
+                    )
+                    FROM client.troncon_client t2 
+                    WHERE t1.id_tronc = t2.id_tronc AND t1.cumuld IS NOT NULL
                 """)
+                logger.info(f"Updated seg_prj for {cur.rowcount} images")
                 
-                # Update route_client with grouped geometries from troncon_client
-                logger.info("Updating client.route_client with grouped calibrated geometries...")
-                update_sql = """
-                UPDATE client.route_client rc
-                SET geom_calib = grouped_geom.multi_geom_calib
+                # Calculate d_angle_seg
+                logger.info("Step 7d: Calculating d_angle_seg")
+                cur.execute("UPDATE public.image SET d_angle_seg = degrees(ST_Angle(seg_ss, seg_prj)) WHERE seg_ss IS NOT NULL AND seg_prj IS NOT NULL")
+                logger.info(f"Updated d_angle_seg for {cur.rowcount} images")
+                
+                # Normalize angles
+                logger.info("Step 7e: Normalizing angles")
+                cur.execute("""
+                    UPDATE public.image 
+                    SET d_angle_seg = CASE 
+                        WHEN abs(d_angle_seg) BETWEEN 0 AND 180 THEN d_angle_seg
+                        WHEN abs(d_angle_seg) BETWEEN 180 AND 360 THEN d_angle_seg - 180
+                    END
+                    WHERE d_angle_seg IS NOT NULL
+                """)
+                logger.info(f"Normalized angles for {cur.rowcount} images")
+                
+                logger.info("Completed initial projections and angles")
+                
+            except Exception as e:
+                logger.error(f"Error in step 7: {e}")
+                raise
+        
+        self.conn.commit()
+
+    def step8_handle_perpendicular_cases(self):
+        """Step 8: Re-project perpendicular cases (45°-135°)"""
+        logger.info("Step 8: Handling perpendicular projection cases")
+        
+        with self.conn.cursor() as cur:
+            # Add columns to projection_img_dist for perpendicular handling
+            cur.execute("ALTER TABLE traitement.projection_img_dist ADD COLUMN IF NOT EXISTS gid SERIAL")
+            cur.execute("ALTER TABLE traitement.projection_img_dist ADD COLUMN IF NOT EXISTS d_angle_seg NUMERIC")
+            cur.execute("UPDATE traitement.projection_img_dist SET d_angle_seg = 0.0")
+            
+            # Update angles in projection_img_dist
+            cur.execute("""
+                UPDATE traitement.projection_img_dist t1 
+                SET d_angle_seg = t2.d_angle_seg 
+                FROM public.image t2
+                WHERE t1.id = t2.id AND t1.id_tronc = t2.id_tronc
+            """)
+            
+            # Reset perpendicular projections
+            cur.execute("""
+                UPDATE public.image 
+                SET id_tronc = NULL, prj_quality = NULL, cumuld = NULL, geom_prj = NULL, seg_prj = NULL
+                WHERE d_angle_seg BETWEEN 45.0 AND 135.0
+            """)
+            
+            # Re-assign best non-perpendicular matches
+            cur.execute("""
+                UPDATE public.image t1 
+                SET id_tronc = r1.id_tronc, prj_quality = r1.min_dist
                 FROM (
-                    SELECT 
-                        axe,
-                        ST_Collect(
-                            geom_calib 
-                            ORDER BY CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)
-                        )::GEOMETRY(MultiLineStringM, 2154) as multi_geom_calib
-                    FROM client.troncon_client
-                    GROUP BY axe
-                ) grouped_geom
-                WHERE rc.axe = grouped_geom.axe;
-                """
-                
-                cursor.execute(update_sql)
-                rows_updated = cursor.rowcount
-                
-                self.connection.commit()
-                logger.info(f"Successfully updated {rows_updated} routes with grouped calibrated geometries")
-                
-                # Verify the update
-                cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_routes,
-                    COUNT(CASE WHEN geom_calib IS NOT NULL THEN 1 END) as routes_with_calib_geom,
-                    COUNT(CASE WHEN ST_GeometryType(geom_calib) = 'ST_MultiLineStringM' THEN 1 END) as routes_with_correct_type
-                FROM client.route_client;
-                """)
-                
-                verification = cursor.fetchone()
-                logger.info(f"Route-level verification - Total: {verification[0]}, "
-                          f"With calibrated geom: {verification[1]}, "
-                          f"Correct geometry type: {verification[2]}")
-                
-                return True
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to update route_client with calibrated geometries: {e}")
-            self.connection.rollback()
-            return False
-    
-    def get_calibration_summary(self) -> Optional[dict]:
-        """
-        Get comprehensive summary statistics of the calibration process
+                    SELECT t1.id, t1.id_tronc, r1.min_dist 
+                    FROM traitement.projection_img_dist t1
+                    JOIN (
+                        SELECT id, min(dist) as min_dist 
+                        FROM traitement.projection_img_dist 
+                        WHERE NOT d_angle_seg BETWEEN 45.0 AND 135.0 
+                        GROUP BY id
+                    ) r1 ON t1.id = r1.id AND t1.dist = r1.min_dist
+                ) r1
+                WHERE t1.id = r1.id AND t1.id_tronc IS NULL
+            """)
+            
+            logger.info("Re-projected perpendicular cases")
         
-        Returns:
-            dict: Summary statistics or None if error
+        self.conn.commit()
+
+    def step9_final_projections(self):
+        """Step 9: Calculate final projections for re-assigned images"""
+        logger.info("Step 9: Calculating final projections")
+        
+        with self.conn.cursor() as cur:
+            try:
+                # Final projection calculations for perpendicular cases
+                logger.info("Step 9a: Final projections for perpendicular cases")
+                cur.execute("""
+                    UPDATE public.image point 
+                    SET 
+                        cumuld = ST_M(ST_LineInterpolatePoint(line.geom_calib, ST_LineLocatePoint(line.geom_calib, point.geom))),
+                        geom_prj = ST_Force2D(ST_LineInterpolatePoint(line.geom_calib, ST_LineLocatePoint(line.geom_calib, point.geom)))
+                    FROM client.troncon_client line
+                    WHERE (point.d_angle_seg BETWEEN 45.0 AND 135.0) AND point.id_tronc = line.id_tronc AND point.id_tronc IS NOT NULL
+                """)
+                logger.info(f"Updated projections for {cur.rowcount} perpendicular cases")
+                
+                # Update ln_prj for perpendicular cases
+                logger.info("Step 9b: Update ln_prj for perpendicular cases")
+                cur.execute("UPDATE public.image SET ln_prj = ST_Force2D(ST_MakeLine(geom, geom_prj)) WHERE d_angle_seg BETWEEN 45.0 AND 135.0 AND geom_prj IS NOT NULL")
+                logger.info(f"Updated ln_prj for {cur.rowcount} perpendicular cases")
+                
+                # Update seg_prj for perpendicular cases
+                logger.info("Step 9c: Update seg_prj for perpendicular cases")
+                cur.execute("""
+                    UPDATE public.image t1 
+                    SET seg_prj = ST_Force2D(
+                        st_geometryN(
+                            ST_LocateBetween(t2.geom_calib, t1.cumuld-1.0, t1.cumuld+1.0), 1
+                        )
+                    )
+                    FROM client.troncon_client t2 
+                    WHERE (t1.d_angle_seg BETWEEN 45.0 AND 135.0) AND t1.id_tronc = t2.id_tronc AND t1.cumuld IS NOT NULL
+                """)
+                logger.info(f"Updated seg_prj for {cur.rowcount} perpendicular cases")
+                
+                # Update angles for perpendicular cases
+                logger.info("Step 9d: Update angles for perpendicular cases")
+                cur.execute("UPDATE public.image SET d_angle_seg = degrees(ST_Angle(seg_ss, seg_prj)) WHERE d_angle_seg BETWEEN 45.0 AND 135.0 AND seg_ss IS NOT NULL AND seg_prj IS NOT NULL")
+                logger.info(f"Updated angles for {cur.rowcount} perpendicular cases")
+                
+                # Final update for all seg_prj
+                logger.info("Step 9e: Final update for all seg_prj")
+                cur.execute("""
+                    UPDATE public.image t1 
+                    SET seg_prj = ST_Force2D(
+                        st_geometryN(
+                            ST_LocateBetween(t2.geom_calib, t1.cumuld-1.0, t1.cumuld+1.0), 1
+                        )
+                    )
+                    FROM client.troncon_client t2 
+                    WHERE t1.id_tronc = t2.id_tronc AND t1.cumuld IS NOT NULL
+                """)
+                logger.info(f"Final seg_prj update for {cur.rowcount} images")
+                
+                # Final angle calculation and normalization
+                logger.info("Step 9f: Final angle calculations")
+                cur.execute("UPDATE public.image SET d_angle_seg = degrees(ST_Angle(seg_ss, seg_prj)) WHERE seg_ss IS NOT NULL AND seg_prj IS NOT NULL")
+                cur.execute("""
+                    UPDATE public.image 
+                    SET d_angle_seg = CASE 
+                        WHEN abs(d_angle_seg) BETWEEN 0 AND 180 THEN d_angle_seg
+                        WHEN abs(d_angle_seg) BETWEEN 180 AND 360 THEN d_angle_seg - 180
+                    END
+                    WHERE d_angle_seg IS NOT NULL
+                """)
+                logger.info(f"Final angle normalization for {cur.rowcount} images")
+                
+                logger.info("Completed final projections")
+                
+            except Exception as e:
+                logger.error(f"Error in step 9: {e}")
+                raise
+        
+        self.conn.commit()
+
+    def step10_update_axe_values(self):
+        """Step 10: Update axe values from troncon_client"""
+        logger.info("Step 10: Updating axe values")
+        
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.image t1 
+                SET axe = t2.axe
+                FROM client.troncon_client t2 
+                WHERE t1.id_tronc = t2.id_tronc AND t1.axe IS NULL
+            """)
+            affected_rows = cur.rowcount
+            logger.info(f"Updated axe values for {affected_rows} images")
+        
+        self.conn.commit()
+
+    def get_statistics(self) -> Dict[str, int]:
+        """Get processing statistics"""
+        with self.conn.cursor() as cur:
+            # Total images
+            cur.execute("SELECT COUNT(*) FROM public.image")
+            total_images = cur.fetchone()[0]
+            
+            # Matched images
+            cur.execute("SELECT COUNT(*) FROM public.image WHERE id_tronc IS NOT NULL")
+            matched_images = cur.fetchone()[0]
+            
+            # Valid pairs
+            cur.execute("SELECT COUNT(*) FROM traitement.projection_paire WHERE is_paire = true")
+            valid_pairs = cur.fetchone()[0]
+            
+            # Unique sessions processed
+            cur.execute("SELECT COUNT(DISTINCT session_id) FROM traitement.projection_paire WHERE is_paire = true")
+            sessions_processed = cur.fetchone()[0]
+            
+            return {
+                'total_images': total_images,
+                'matched_images': matched_images,
+                'match_rate_percent': round((matched_images / total_images * 100) if total_images > 0 else 0, 2),
+                'valid_pairs': valid_pairs,
+                'sessions_processed': sessions_processed
+            }
+
+    def run(self, perpendicular_iterations: int = 2) -> Dict[str, int]:
+        """Run the complete map-matching process following SQL algorithm
+        
+        Args:
+            perpendicular_iterations: Number of times to run step8 (default: 2)
         """
+        logger.info(f"Starting map-matching process (SQL algorithm implementation)")
+        logger.info(f"Database: {self.db_config['database']}")
+        logger.info(f"Buffer radius: {self.buffer_radius}m")
+        logger.info(f"Min segment length: {self.min_segment_length}m")
+        logger.info(f"Perpendicular iterations: {perpendicular_iterations}")
+        
         try:
-            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Segment-level statistics
-                cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_segments,
-                    COUNT(DISTINCT axe) as total_routes,
-                    MIN(cumuld) as min_start_measure,
-                    MAX(cumulf) as max_end_measure,
-                    AVG(cumulf - cumuld) as avg_segment_length,
-                    MIN(CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)) as min_segment_num,
-                    MAX(CAST(SUBSTRING(id_tronc FROM '_([0-9]+)$') AS INTEGER)) as max_segment_num
-                FROM client.troncon_client;
-                """)
-                
-                summary = dict(cursor.fetchone())
-                
-                # Calibration accuracy validation
-                cursor.execute("""
-                WITH route_validation AS (
-                    SELECT 
-                        tc.axe,
-                        MAX(tc.cumulf) as final_cumulf,
-                        rc.longueur as declared_longueur,
-                        ABS(MAX(tc.cumulf) - rc.longueur) as difference
-                    FROM client.troncon_client tc
-                    JOIN client.route_client rc ON tc.axe = rc.axe
-                    GROUP BY tc.axe, rc.longueur
-                )
-                SELECT 
-                    COUNT(*) as total_routes_checked,
-                    COUNT(CASE WHEN difference < 0.01 THEN 1 END) as correctly_calibrated_routes,
-                    AVG(difference) as avg_calibration_difference,
-                    MAX(difference) as max_calibration_difference
-                FROM route_validation;
-                """)
-                
-                validation = cursor.fetchone()
-                summary.update(dict(validation))
-                
-                # Route-level calibrated geometry statistics
-                cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_routes_in_route_client,
-                    COUNT(CASE WHEN geom_calib IS NOT NULL THEN 1 END) as routes_with_grouped_geom,
-                    COUNT(CASE WHEN ST_GeometryType(geom_calib) = 'ST_MultiLineStringM' THEN 1 END) as routes_with_correct_geom_type
-                FROM client.route_client;
-                """)
-                
-                route_stats = cursor.fetchone()
-                summary.update(dict(route_stats))
-                
-                return summary
-                
-        except psycopg2.Error as e:
-            logger.error(f"Failed to get summary: {e}")
-            return None
+            self.connect()
+            
+            # Execute all steps in sequence
+            self.step1_update_seg_ss()
+            self.step2_create_schema_and_projection_paire()
+            self.step3_determine_valid_pairs()
+            self.step4_reset_image_projections()
+            self.step5_create_projection_img_dist()
+            self.step6_assign_best_troncons()
+            self.step7_calculate_projections()
+            
+            # Run step8 multiple times as specified
+            for iteration in range(perpendicular_iterations):
+                logger.info(f"Running perpendicular handling iteration {iteration + 1}/{perpendicular_iterations}")
+                self.step8_handle_perpendicular_cases()
+            
+            self.step9_final_projections()
+            self.step10_update_axe_values()
+            
+            # Get final statistics
+            results = self.get_statistics()
+            logger.info(f"Map-matching completed successfully: {results}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Fatal error in map-matching process: {e}")
+            if self.conn:
+                self.conn.rollback()
+            raise
+        finally:
+            self.disconnect()
 
 
-def main():
-    """
-    Main execution function
-    Orchestrates the complete calibration process
+def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0, database: str = 'cd08_demo'):
+    """Main function to run the map-matching program
+    
+    Args:
+        perpendicular_iterations: Number of times to run perpendicular handling (default: 2)
+        buffer_radius: Buffer radius in meters for segment matching (default: 24.0)
+        min_segment_length: Minimum valid projected segment length in meters (default: 50.0)
+        database: Database name (default: 'cd08_demo')
     """
     
-    # Database configuration for cd08_demo
+    # Database configuration
     db_config = {
-        'host': 'localhost',
-        'database': 'cd08_demo',
-        'user': 'diagway',
-        'password': 'diagway',
-        'port': 5433
+        'host': 'localhost',          # Update with your host
+        'database': database,         # Configurable database name
+        'user': 'diagway',           # Update with your username
+        'password': 'diagway',       # Update with your password
+        'port': 5433                  # Update with your port
     }
     
-    # Initialize calibrator
-    calibrator = RoadCalibrator(db_config)
+    # Create and run map matcher
+    matcher = MapMatcher(db_config, buffer_radius, min_segment_length)
     
     try:
-        logger.info("🚀 Starting Road Network Linear Referencing Calibration")
-        logger.info("=" * 60)
-        
-        # Step 1: Connect to database
-        if not calibrator.connect():
-            logger.error("Failed to connect to database. Exiting.")
-            sys.exit(1)
-        
-        # Step 2: Create target table for segments
-        logger.info("📋 Creating/verifying segment table...")
-        if not calibrator.create_troncon_table():
-            logger.error("Failed to create target table. Exiting.")
-            sys.exit(1)
-        
-        # Step 3: Perform route calibration (create segments)
-        logger.info("⚙️  Starting route calibration with ratio adjustment...")
-        if not calibrator.calibrate_routes():
-            logger.error("Calibration failed. Exiting.")
-            sys.exit(1)
-        
-        # Step 4: Validate calibration results
-        logger.info("✅ Validating calibration results...")
-        if not calibrator.validate_calibration():
-            logger.warning("Validation found issues, but calibration completed")
-        
-        # Step 5: Update route_client with grouped calibrated geometries
-        logger.info("📊 Creating route-level calibrated geometries...")
-        if not calibrator.update_route_client_with_calibrated_geom():
-            logger.error("Failed to update route_client with calibrated geometries")
-            sys.exit(1)
-        
-        # Step 6: Generate final summary report
-        logger.info("📈 Generating final summary...")
-        summary = calibrator.get_calibration_summary()
-        
-        if summary:
-            logger.info("=" * 60)
-            logger.info("🎉 FINAL CALIBRATION SUMMARY")
-            logger.info("=" * 60)
-            logger.info(f"📦 SEGMENT LEVEL (client.troncon_client):")
-            logger.info(f"   • Total segments created: {summary['total_segments']}")
-            logger.info(f"   • Routes processed: {summary['total_routes']}")
-            logger.info(f"   • Segment range: {summary['min_segment_num']} to {summary['max_segment_num']}")
-            logger.info(f"   • Average segment length: {summary['avg_segment_length']:.2f}m")
-            logger.info(f"   • Measure range: {summary['min_start_measure']:.2f} to {summary['max_end_measure']:.2f}m")
-            
-            logger.info(f"📏 CALIBRATION ACCURACY:")
-            logger.info(f"   • Correctly calibrated routes: {summary['correctly_calibrated_routes']}/{summary['total_routes_checked']}")
-            logger.info(f"   • Average difference: {summary['avg_calibration_difference']:.6f}m")
-            logger.info(f"   • Maximum difference: {summary['max_calibration_difference']:.6f}m")
-            
-            logger.info(f"🛣️  ROUTE LEVEL (client.route_client.geom_calib):")
-            logger.info(f"   • Routes with grouped geometries: {summary['routes_with_grouped_geom']}/{summary['total_routes_in_route_client']}")
-            logger.info(f"   • Correct geometry types: {summary['routes_with_correct_geom_type']}")
-        
-        logger.info("=" * 60)
-        logger.info("🎉 SUCCESS! Road network calibration completed!")
-        logger.info("📊 Both segment-level and route-level calibrations are ready")
-        logger.info("🔧 Use client.troncon_client for detailed segment analysis")  
-        logger.info("🗺️  Use client.route_client.geom_calib for route-level referencing")
-        logger.info("=" * 60)
+        results = matcher.run(perpendicular_iterations)
+        print(f"\n=== Map-matching Results ===")
+        print(f"Database: {database}")
+        print(f"Buffer radius: {buffer_radius}m")
+        print(f"Min segment length: {min_segment_length}m")
+        print(f"Perpendicular iterations: {perpendicular_iterations}")
+        print(f"Total images: {results['total_images']}")
+        print(f"Successfully matched: {results['matched_images']}")
+        print(f"Match rate: {results['match_rate_percent']}%")
+        print(f"Valid session-troncon pairs: {results['valid_pairs']}")
+        print(f"Sessions processed: {results['sessions_processed']}")
+        print(f"Map-matching completed successfully!")
         
     except Exception as e:
-        logger.error(f"💥 Unexpected error: {e}")
-        sys.exit(1)
-        
-    finally:
-        calibrator.disconnect()
+        print(f"Map-matching failed: {e}")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    # Create argument parser
+    parser = argparse.ArgumentParser(
+        description='Map-matching program for road images to linear referencing system',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        '-i', '--perpendicular-iterations',
+        type=int,
+        default=2,
+        help='Number of times to run perpendicular handling (step8)'
+    )
+    
+    parser.add_argument(
+        '-b', '--buffer-radius',
+        type=float,
+        default=24.0,
+        help='Buffer radius in meters for segment matching'
+    )
+    
+    parser.add_argument(
+        '-s', '--min-segment-length',
+        type=float,
+        default=50.0,
+        help='Minimum valid projected segment length in meters'
+    )
+    
+    parser.add_argument(
+        '-d', '--database',
+        type=str,
+        default='cd08_demo',
+        help='Database name to connect to'
+    )
+    
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging (DEBUG level)'
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.perpendicular_iterations < 1:
+        parser.error("perpendicular_iterations must be >= 1")
+    
+    if args.buffer_radius <= 0:
+        parser.error("buffer_radius must be > 0")
+    
+    if args.min_segment_length <= 0:
+        parser.error("min_segment_length must be > 0")
+    
+    if not args.database.strip():
+        parser.error("database name cannot be empty")
+    
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose logging enabled")
+    
+    print(f"Starting map-matching with:")
+    print(f"  - Database: {args.database}")
+    print(f"  - Perpendicular iterations: {args.perpendicular_iterations}")
+    print(f"  - Buffer radius: {args.buffer_radius}m")
+    print(f"  - Min segment length: {args.min_segment_length}m")
+    print(f"  - Verbose logging: {'enabled' if args.verbose else 'disabled'}")
+    print()
+    
+    exit(main(args.perpendicular_iterations, args.buffer_radius, args.min_segment_length, args.database))
