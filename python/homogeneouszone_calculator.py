@@ -217,12 +217,21 @@ class HomogeneousZoneCalculator:
         # Create initial zones (each data point is a zone)
         # Cast all numeric values to float to avoid Decimal type issues
         current_zh_list = []
+        skipped_zero_length = 0
         for row in rows:
+            cumuld_val = float(row[2]) if row[2] is not None else 0.0
+            cumulf_val = float(row[3]) if row[3] is not None else 0.0
+            
+            # Skip zero-length zones
+            if abs(cumulf_val - cumuld_val) < 1e-6:
+                skipped_zero_length += 1
+                continue
+            
             zh = ZHomogene(
                 id=int(row[0]),
                 section_id=str(row[1]),
-                cumuld=float(row[2]) if row[2] is not None else 0.0,
-                cumulf=float(row[3]) if row[3] is not None else 0.0,
+                cumuld=cumuld_val,
+                cumulf=cumulf_val,
                 mean_val=float(row[4]) if row[4] is not None else 0.0,
                 min_val=float(row[4]) if row[4] is not None else 0.0,
                 max_val=float(row[4]) if row[4] is not None else 0.0
@@ -233,6 +242,9 @@ class HomogeneousZoneCalculator:
                 zh.prf = str(row[7]) if row[7] is not None else ""
                 zh.abf = str(row[8]) if row[8] is not None else ""
             current_zh_list.append(zh)
+        
+        if skipped_zero_length > 0:
+            print(f"Skipped {skipped_zero_length} zero-length zones")
         
         cursor.close()
         print(f"Initial zones: {len(current_zh_list)}")
@@ -285,10 +297,15 @@ class HomogeneousZoneCalculator:
                     # Calculate weighted mean and new min/max
                     len_fusion = abs(fusion_zh.cumulf - fusion_zh.cumuld)
                     len_current = abs(current_zh.cumulf - current_zh.cumuld)
+                    total_len = len_fusion + len_current
                     
-                    new_mean = ((current_zh.mean_val * len_current + 
-                               fusion_zh.mean_val * len_fusion) / 
-                              (len_fusion + len_current))
+                    # Handle edge case of zero-length zones
+                    if total_len < 1e-6:
+                        new_mean = (fusion_zh.mean_val + current_zh.mean_val) / 2.0
+                    else:
+                        new_mean = ((current_zh.mean_val * len_current + 
+                                   fusion_zh.mean_val * len_fusion) / total_len)
+                    
                     new_min = min(fusion_zh.min_val, current_zh.min_val)
                     new_max = max(fusion_zh.max_val, current_zh.max_val)
                     
@@ -321,10 +338,15 @@ class HomogeneousZoneCalculator:
                     current_zh = zh_list[zh_idx]
                     len_fusion = abs(fusion_zh.cumulf - fusion_zh.cumuld)
                     len_current = abs(current_zh.cumulf - current_zh.cumuld)
+                    total_len = len_fusion + len_current
                     
-                    new_mean = ((current_zh.mean_val * len_current + 
-                               fusion_zh.mean_val * len_fusion) / 
-                              (len_fusion + len_current))
+                    # Handle edge case of zero-length zones
+                    if total_len < 1e-6:
+                        new_mean = (fusion_zh.mean_val + current_zh.mean_val) / 2.0
+                    else:
+                        new_mean = ((current_zh.mean_val * len_current + 
+                                   fusion_zh.mean_val * len_fusion) / total_len)
+                    
                     new_min = min(fusion_zh.min_val, current_zh.min_val)
                     new_max = max(fusion_zh.max_val, current_zh.max_val)
                     
@@ -462,13 +484,22 @@ class HomogeneousZoneCalculator:
         """Merge two adjacent zones"""
         len1 = abs(zh1.cumulf - zh1.cumuld)
         len2 = abs(zh2.cumulf - zh2.cumuld)
+        total_len = len1 + len2
+        
+        # Handle edge case of zero-length zones
+        if total_len < 1e-6:
+            # Use simple average if both zones have zero length
+            mean_val = (zh1.mean_val + zh2.mean_val) / 2.0
+        else:
+            # Calculate weighted mean
+            mean_val = ((zh1.mean_val * len1 + zh2.mean_val * len2) / total_len)
         
         merged = ZHomogene(
             id=zh1.id,
             section_id=zh1.section_id,
             cumuld=zh1.cumuld,
             cumulf=zh2.cumulf,
-            mean_val=((zh1.mean_val * len1 + zh2.mean_val * len2) / (len1 + len2)),
+            mean_val=mean_val,
             min_val=min(zh1.min_val, zh2.min_val),
             max_val=max(zh1.max_val, zh2.max_val)
         )
