@@ -23,7 +23,12 @@ FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/res
 
 # Export folder - change this to your desired location
 # Examples: "export_arcgis", "C:/exports", "../data/exports"
-EXPORT_FOLDER = "export_arcgis"
+EXPORT_FOLDER = "D:/Tmp/CD16/Export_arcgis_files"
+
+# Auto-confirm updates - set to True to skip confirmation prompts
+# True: No confirmation needed, automatic updates
+# False: Will ask "Do you want to proceed?" before updating
+AUTO_CONFIRM = True
 
 # New SAS token to replace all old ones
 NEW_SAS = "?sv=2023-01-03&st=2025-02-13T08%3A27%3A49Z&se=2028-02-14T08%3A27%3A00Z&sr=c&sp=r&sig=6STZ6XA8DiGkBLg5Z4xfmtQ3zyak0HJEqyNnSPJCjmQ%3D"
@@ -257,10 +262,14 @@ def replace_layer_data(gis, feature_layer, modified_features):
             print("✗ Test update returned no results")
             return False
         
-        response = input("\nTest successful! Do you want to proceed with all updates? (yes/no): ")
-        if response.lower() not in ['yes', 'y']:
-            print("✗ Operation cancelled.")
-            return False
+        # Check if auto-confirm is enabled
+        if AUTO_CONFIRM:
+            print("\n✓ AUTO_CONFIRM enabled - proceeding with all updates automatically...")
+        else:
+            response = input("\nTest successful! Do you want to proceed with all updates? (yes/no): ")
+            if response.lower() not in ['yes', 'y']:
+                print("✗ Operation cancelled.")
+                return False
         
         # Update features in small batches with retry logic
         print("\nUpdating features in small batches...")
