@@ -4,21 +4,35 @@ import pandas as pd
 import re
 import urllib3
 import json
+import os
 from datetime import datetime
 
-# Disable SSL warnings
+# Disable SSL warnings (if you're having certificate issues)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configuration
+# ============================================================================
+# CONFIGURATION - MODIFY THESE PARAMETERS
+# ============================================================================
+
+# ArcGIS Online credentials
 ARCGIS_USERNAME = "roadcare"
 ARCGIS_PASSWORD = "Antonin&TienSy2021"
-FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/rest/services/Carte_CD16_V1/FeatureServer/7"
 
-# New SAS token
+# Feature layer URL
+FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/rest/services/Carte_CD16_V1/FeatureServer/1"
+
+# Export folder - change this to your desired location
+# Examples: "export_arcgis", "C:/exports", "../data/exports"
+EXPORT_FOLDER = "export_arcgis"
+
+# New SAS token to replace all old ones
 NEW_SAS = "?sv=2023-01-03&st=2025-02-13T08%3A27%3A49Z&se=2028-02-14T08%3A27%3A00Z&sr=c&sp=r&sig=6STZ6XA8DiGkBLg5Z4xfmtQ3zyak0HJEqyNnSPJCjmQ%3D"
 
-# Regex pattern to match SAS tokens
+# ============================================================================
+
+# Regex pattern to match SAS tokens (starting with ?sv= and continuing with SAS parameters)
 SAS_PATTERN = re.compile(r'\?sv=[^?\s]*')
+
 
 def export_layer():
     """
@@ -29,6 +43,13 @@ def export_layer():
     print("="*70)
     
     try:
+        # Create export folder if it doesn't exist
+        if not os.path.exists(EXPORT_FOLDER):
+            os.makedirs(EXPORT_FOLDER)
+            print(f"✓ Created export folder: {EXPORT_FOLDER}")
+        else:
+            print(f"✓ Using export folder: {EXPORT_FOLDER}")
+        
         # Connect to ArcGIS Online
         print("\nConnecting to ArcGIS Online...")
         gis = GIS("https://www.arcgis.com", ARCGIS_USERNAME, ARCGIS_PASSWORD, verify_cert=False)
@@ -37,7 +58,8 @@ def export_layer():
         # Access the feature layer
         print("\nAccessing feature layer...")
         feature_layer = FeatureLayer(FEATURE_LAYER_URL, gis)
-        print(f"✓ Layer: {feature_layer.properties.name}")
+        layer_name = feature_layer.properties.name
+        print(f"✓ Layer: {layer_name}")
         
         # Query all features
         print("\nQuerying all features...")
@@ -55,7 +77,7 @@ def export_layer():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save as CSV (without geometry)
-        csv_file = f"export_pas_elementaire_{timestamp}.csv"
+        csv_file = os.path.join(EXPORT_FOLDER, f"export_{layer_name}_{timestamp}.csv")
         df_export = df.copy()
         if 'SHAPE' in df_export.columns:
             df_export = df_export.drop('SHAPE', axis=1)
@@ -63,7 +85,7 @@ def export_layer():
         print(f"\n✓ Exported to CSV: {csv_file}")
         
         # Save as JSON (raw features with geometry)
-        json_file = f"export_pas_elementaire_{timestamp}.json"
+        json_file = os.path.join(EXPORT_FOLDER, f"export_{layer_name}_{timestamp}.json")
         features_json = {
             "features": [f.as_dict for f in features],
             "spatialReference": feature_set.spatial_reference,
@@ -74,11 +96,11 @@ def export_layer():
         print(f"✓ Exported to JSON: {json_file}")
         
         # Save schema info
-        schema_file = f"schema_pas_elementaire_{timestamp}.txt"
+        schema_file = os.path.join(EXPORT_FOLDER, f"schema_{layer_name}_{timestamp}.txt")
         with open(schema_file, 'w', encoding='utf-8') as f:
             f.write("LAYER SCHEMA\n")
             f.write("="*70 + "\n\n")
-            f.write(f"Layer Name: {feature_layer.properties.name}\n")
+            f.write(f"Layer Name: {layer_name}\n")
             f.write(f"Layer URL: {FEATURE_LAYER_URL}\n")
             f.write(f"Feature Count: {len(df)}\n\n")
             f.write("FIELDS:\n")
@@ -87,16 +109,16 @@ def export_layer():
         print(f"✓ Schema saved to: {schema_file}")
         
         # Return both features (with geometry) and dataframe
-        return features, df, csv_file, json_file, gis, feature_layer
+        return features, df, csv_file, json_file, gis, feature_layer, layer_name
         
     except Exception as e:
         print(f"\n✗ Export failed: {str(e)}")
         import traceback
         traceback.print_exc()
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 
-def edit_data_locally(features, df, csv_file):
+def edit_data_locally(features, df, csv_file, layer_name):
     """
     Step 2: Edit the data locally - replace SAS tokens
     Preserves geometry and OBJECTID for updates
@@ -160,13 +182,13 @@ def edit_data_locally(features, df, csv_file):
         
         # Save modified data (JSON with geometry)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"modified_pas_elementaire_{timestamp}.json"
+        output_file = os.path.join(EXPORT_FOLDER, f"modified_{layer_name}_{timestamp}.json")
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump({"features": modified_features}, f, indent=2, ensure_ascii=False)
         print(f"✓ Modified data saved to: {output_file}")
         
         # Also save as CSV for review
-        csv_output = f"modified_pas_elementaire_{timestamp}.csv"
+        csv_output = os.path.join(EXPORT_FOLDER, f"modified_{layer_name}_{timestamp}.csv")
         df_modified = df.copy()
         
         # Update the dataframe with new filenames
@@ -326,14 +348,15 @@ def main():
     print("="*70)
     print("ArcGIS ONLINE - EXPORT, EDIT, UPDATE WORKFLOW")
     print("="*70)
+    print(f"Export folder: {os.path.abspath(EXPORT_FOLDER)}\n")
     
     # Step 1: Export
-    features, df, csv_file, json_file, gis, feature_layer = export_layer()
+    features, df, csv_file, json_file, gis, feature_layer, layer_name = export_layer()
     if features is None:
         return
     
     # Step 2: Edit locally (preserving geometry and OBJECTID)
-    result = edit_data_locally(features, df, csv_file)
+    result = edit_data_locally(features, df, csv_file, layer_name)
     if result is None or result[0] is None:
         return
     modified_features, output_file = result
@@ -348,6 +371,7 @@ def main():
         print(f"\nNew SAS token expires: 2028-02-14")
         print(f"Geometry and OBJECTID preserved for all features")
         print(f"Only features with SAS tokens were updated")
+        print(f"\nAll files saved to: {os.path.abspath(EXPORT_FOLDER)}")
     else:
         print("\n" + "="*70)
         print("✗ WORKFLOW FAILED")
