@@ -23,12 +23,16 @@ FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/res
 
 # Export folder - change this to your desired location
 # Examples: "export_arcgis", "C:/exports", "../data/exports"
-EXPORT_FOLDER = "D:/Tmp/CD16/Export_arcgis_files"
+EXPORT_FOLDER = "export_arcgis"
+
+# Attribute name containing the SAS token to replace
+# Change this to match the field name in your layer
+ATTRIBUTE_NAME = "filename"
 
 # Auto-confirm updates - set to True to skip confirmation prompts
 # True: No confirmation needed, automatic updates
 # False: Will ask "Do you want to proceed?" before updating
-AUTO_CONFIRM = True
+AUTO_CONFIRM = False
 
 # New SAS token to replace all old ones
 NEW_SAS = "?sv=2023-01-03&st=2025-02-13T08%3A27%3A49Z&se=2028-02-14T08%3A27%3A00Z&sr=c&sp=r&sig=6STZ6XA8DiGkBLg5Z4xfmtQ3zyak0HJEqyNnSPJCjmQ%3D"
@@ -133,14 +137,14 @@ def edit_data_locally(features, df, csv_file, layer_name):
     print("="*70)
     
     try:
-        # Check if filename field exists
-        if 'filename' not in df.columns:
-            print("\n✗ 'filename' column not found in the data!")
+        # Check if attribute field exists
+        if ATTRIBUTE_NAME not in df.columns:
+            print(f"\n✗ '{ATTRIBUTE_NAME}' column not found in the data!")
             print(f"Available columns: {', '.join(df.columns.tolist())}")
             return None, None
         
         # Find and replace SAS tokens in the features
-        print("\nSearching for SAS tokens in 'filename' field...")
+        print(f"\nSearching for SAS tokens in '{ATTRIBUTE_NAME}' field...")
         old_sas_tokens = set()
         modified_features = []
         update_count = 0
@@ -149,19 +153,19 @@ def edit_data_locally(features, df, csv_file, layer_name):
             attrs = feature.attributes
             feature_dict = feature.as_dict.copy()
             
-            if 'filename' in attrs and attrs['filename']:
-                filename = str(attrs['filename'])
-                match = SAS_PATTERN.search(filename)
+            if ATTRIBUTE_NAME in attrs and attrs[ATTRIBUTE_NAME]:
+                attribute_value = str(attrs[ATTRIBUTE_NAME])
+                match = SAS_PATTERN.search(attribute_value)
                 
                 if match:
                     old_sas = match.group(0)
                     old_sas_tokens.add(old_sas)
                     
                     # Replace with new SAS token
-                    new_filename = SAS_PATTERN.sub(NEW_SAS, filename)
+                    new_value = SAS_PATTERN.sub(NEW_SAS, attribute_value)
                     
                     # Update the feature (preserving OBJECTID and geometry)
-                    feature_dict['attributes']['filename'] = new_filename
+                    feature_dict['attributes'][ATTRIBUTE_NAME] = new_value
                     modified_features.append(feature_dict)
                     
                     update_count += 1
@@ -196,15 +200,15 @@ def edit_data_locally(features, df, csv_file, layer_name):
         csv_output = os.path.join(EXPORT_FOLDER, f"modified_{layer_name}_{timestamp}.csv")
         df_modified = df.copy()
         
-        # Update the dataframe with new filenames
+        # Update the dataframe with new values
         for mod_feature in modified_features:
             mod_attrs = mod_feature['attributes']
             objectid = mod_attrs.get('OBJECTID')
-            if objectid and 'filename' in mod_attrs:
+            if objectid and ATTRIBUTE_NAME in mod_attrs:
                 # Find matching row in dataframe
                 mask = df_modified['OBJECTID'] == objectid
                 if mask.any():
-                    df_modified.loc[mask, 'filename'] = mod_attrs['filename']
+                    df_modified.loc[mask, ATTRIBUTE_NAME] = mod_attrs[ATTRIBUTE_NAME]
         
         df_export = df_modified.copy()
         if 'SHAPE' in df_export.columns:
