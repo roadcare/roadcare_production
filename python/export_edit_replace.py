@@ -19,7 +19,7 @@ ARCGIS_USERNAME = "roadcare"
 ARCGIS_PASSWORD = "Antonin&TienSy2021"
 
 # Feature layer URL
-FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/rest/services/Carte_CD16_V1/FeatureServer/1"
+FEATURE_LAYER_URL = "https://services-eu1.arcgis.com/PB4bGIQ2JEvZVdru/arcgis/rest/services/SQY_Trottoirs_V7/FeatureServer/4"
 
 # Export folder - change this to your desired location
 # Examples: "export_arcgis", "C:/exports", "../data/exports"
@@ -27,7 +27,7 @@ EXPORT_FOLDER = "export_arcgis"
 
 # Attribute name containing the SAS token to replace
 # Change this to match the field name in your layer
-ATTRIBUTE_NAME = "filename"
+ATTRIBUTE_NAME = "fullname"
 
 # Auto-confirm updates - set to True to skip confirmation prompts
 # True: No confirmation needed, automatic updates

@@ -34,12 +34,52 @@ class MapMatcher:
     def connect(self):
         """Establish database connection"""
         try:
-            self.conn = psycopg2.connect(**self.db_config)
-            self.conn.autocommit = False
-            logger.info("Database connection established")
+            # Set environment variable for PostgreSQL client encoding
+            import os
+            os.environ['PGCLIENTENCODING'] = 'UTF8'
+            
+            # Add client_encoding to handle PostgreSQL 17 encoding issues
+            conn_params = self.db_config.copy()
+            conn_params['client_encoding'] = 'UTF8'
+            
+            self.conn = psycopg2.connect(**conn_params)
+            
+            # Set connection to autocommit temporarily to change encoding
+            old_autocommit = self.conn.autocommit
+            self.conn.autocommit = True
+            
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SET CLIENT_ENCODING TO 'UTF8'")
+            finally:
+                # Restore original autocommit setting
+                self.conn.autocommit = old_autocommit
+            
+            logger.info("Database connection established with UTF-8 encoding")
+            
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
-            raise
+            # Try alternative connection with LATIN1 encoding
+            try:
+                logger.warning("Retrying connection with LATIN1 encoding...")
+                conn_params = self.db_config.copy()
+                conn_params['client_encoding'] = 'LATIN1'
+                self.conn = psycopg2.connect(**conn_params)
+                
+                # Set connection to autocommit temporarily to change encoding
+                self.conn.autocommit = True
+                
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute("SET CLIENT_ENCODING TO 'UTF8'")
+                finally:
+                    self.conn.autocommit = False
+                
+                logger.info("Database connection established with LATIN1->UTF8 encoding")
+                
+            except Exception as e2:
+                logger.error(f"Failed to connect with alternative encoding: {e2}")
+                raise
     
     def disconnect(self):
         """Close database connection"""
@@ -562,21 +602,21 @@ if __name__ == "__main__":
     parser.add_argument(
         '-b', '--buffer-radius',
         type=float,
-        default=24.0,
+        default=14.0,
         help='Buffer radius in meters for segment matching'
     )
     
     parser.add_argument(
         '-s', '--min-segment-length',
         type=float,
-        default=50.0,
+        default=20.0,
         help='Minimum valid projected segment length in meters'
     )
     
     parser.add_argument(
         '-d', '--database',
         type=str,
-        default='cd08_demo',
+        default='rcp_pontarlier',
         help='Database name to connect to'
     )
     
