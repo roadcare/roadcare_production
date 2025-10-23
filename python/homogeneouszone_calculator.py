@@ -610,16 +610,16 @@ class HomogeneousZoneCalculator:
 if __name__ == "__main__":
     # Configuration
     HOST = "localhost"
-    PORT = 5434
+    PORT = 5433
     DATABASE = "rcp_cd16"
     USER = "diagway"
     PASSWORD = "diagway"
-    SCHEMA_NAME = "mdb_largeur"
+    SCHEMA_NAME = "mdb"
     
-    THEME_NAME = "largeur"
-    ATTRIBUTE_NAME = "largeur"
-    U_THRESHOLD = 1.0  # Maximum difference from mean
-    MIN_LENGTH = 201.0  # Minimum zone length
+    THEME_NAME = "note_num"
+    ATTRIBUTE_NAME = "note_num"
+    U_THRESHOLD = 0.2  # Maximum difference from mean
+    MIN_LENGTH = 500.0  # Minimum zone length
     
     # Calculate homogeneous zones
     calculator = HomogeneousZoneCalculator(
