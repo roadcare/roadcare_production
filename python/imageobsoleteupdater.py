@@ -21,12 +21,12 @@ def process_axe_worker(args: Tuple) -> Set[str]:
     This runs in a separate process.
     
     Args:
-        args: Tuple of (axe_name, records_data)
+        args: Tuple of (axe_name, records_data, distance_threshold)
         
     Returns:
         Set of IDs to mark as obsolete
     """
-    axe_name, records_data = args
+    axe_name, records_data, distance_threshold = args
     
     if len(records_data) < 2:
         return set()
@@ -77,10 +77,10 @@ def process_axe_worker(args: Tuple) -> Set[str]:
         if np.isnan(img1['cumuld']):
             continue
         
-        # Find all records within ±6 range using vectorized operations
+        # Find all records within ±distance_threshold range using vectorized operations
         # IMPORTANT: Only check j > i to avoid comparing pairs twice
-        lower_bound = img1['cumuld'] - 6
-        upper_bound = img1['cumuld'] + 6
+        lower_bound = img1['cumuld'] - distance_threshold
+        upper_bound = img1['cumuld'] + distance_threshold
         
         # Vectorized search for candidates (only indices greater than i)
         candidates_mask = (cumuld_values >= lower_bound) & (cumuld_values <= upper_bound) & (np.arange(n) > i)
@@ -178,18 +178,21 @@ def apply_business_rules_numpy(img1: np.void, img2: np.void) -> str:
 
 
 class ImageObsoleteUpdater:
-    def __init__(self, db_config: dict, num_processes: int = None):
+    def __init__(self, db_config: dict, num_processes: int = None, distance_threshold: float = 6):
         """
         Initialize the updater with database configuration.
         
         Args:
             db_config: Dictionary with keys: host, database, user, password, port
             num_processes: Number of processes to use (default: cpu_count())
+            distance_threshold: Distance threshold for comparing images (default: 6)
         """
         self.db_config = db_config
         self.num_processes = num_processes or cpu_count()
+        self.distance_threshold = distance_threshold
         self.has_primary_key = False
         logger.info(f"Using {self.num_processes} processes for parallel processing")
+        logger.info(f"Distance threshold set to: {self.distance_threshold}")
     
     def check_primary_key(self):
         """
@@ -445,7 +448,7 @@ class ImageObsoleteUpdater:
         
         # Step 2: Prepare work items for parallel processing
         logger.info("Step 2: Preparing parallel processing tasks...")
-        work_items = [(axe, records) for axe, records in axe_data.items() if len(records) >= 2]
+        work_items = [(axe, records, self.distance_threshold) for axe, records in axe_data.items() if len(records) >= 2]
         logger.info(f"Processing {len(work_items)} axes in parallel...")
         
         # Step 3: Process in parallel using multiprocessing pool
@@ -479,7 +482,7 @@ def main():
     # Database configuration
     db_config = {
         'host': 'localhost',
-        'database': 'rcp_cd16',
+        'database': 'cd12_demo',
         'user': 'diagway',
         'password': 'diagway',
         'port': 5433

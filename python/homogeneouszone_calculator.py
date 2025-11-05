@@ -611,7 +611,7 @@ if __name__ == "__main__":
     # Configuration
     HOST = "localhost"
     PORT = 5433
-    DATABASE = "rcp_cd16"
+    DATABASE = "cd12_demo"
     USER = "diagway"
     PASSWORD = "diagway"
     SCHEMA_NAME = "mdb"
@@ -619,7 +619,7 @@ if __name__ == "__main__":
     THEME_NAME = "note_num"
     ATTRIBUTE_NAME = "note_num"
     U_THRESHOLD = 0.2  # Maximum difference from mean
-    MIN_LENGTH = 500.0  # Minimum zone length
+    MIN_LENGTH = 200.0  # Minimum zone length
     
     # Calculate homogeneous zones
     calculator = HomogeneousZoneCalculator(

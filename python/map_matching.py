@@ -30,56 +30,111 @@ class MapMatcher:
         self.buffer_radius = buffer_radius
         self.min_segment_length = min_segment_length
         self.conn = None
+    
+    def check_and_create_image_fields(self):
+        """Check if required fields exist in public.image table and create them if missing"""
+        logger.info("Checking required fields in public.image table")
+        
+        # Define required fields with their types
+        required_fields = {
+            'id_tronc': 'TEXT',  # Changed from INTEGER to TEXT
+            'axe': 'TEXT',
+            'prj_quality': 'NUMERIC',
+            'cumuld': 'NUMERIC',
+            'geom_prj': 'geometry(Point,2154)',
+            'ln_prj': 'geometry(LineString,2154)',
+            'seg_ss': 'geometry(LineString,2154)',
+            'seg_prj': 'geometry(LineString,2154)',
+            'd_angle_seg': 'NUMERIC'
+        }
+        
+        with self.conn.cursor() as cur:
+            # Check which fields exist
+            cur.execute("""
+                SELECT column_name, data_type, udt_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' 
+                AND table_name = 'image'
+            """)
+            
+            existing_columns = {row[0].lower(): (row[1], row[2]) for row in cur.fetchall()}
+            
+            # Create missing fields
+            fields_created = []
+            for field_name, field_type in required_fields.items():
+                if field_name.lower() not in existing_columns:
+                    logger.info(f"Creating missing field: {field_name} {field_type}")
+                    try:
+                        cur.execute(f"ALTER TABLE public.image ADD COLUMN {field_name} {field_type}")
+                        fields_created.append(field_name)
+                    except Exception as e:
+                        logger.error(f"Failed to create field {field_name}: {e}")
+                        raise
+                else:
+                    logger.debug(f"Field {field_name} already exists")
+            
+            if fields_created:
+                logger.info(f"Created {len(fields_created)} missing fields: {', '.join(fields_created)}")
+                self.conn.commit()
+            else:
+                logger.info("All required fields already exist")
         
     def connect(self):
         """Establish database connection"""
         try:
-            # Set environment variable for PostgreSQL client encoding
+            # Set environment variable for PostgreSQL client encoding to match database
             import os
-            os.environ['PGCLIENTENCODING'] = 'UTF8'
+            os.environ['PGCLIENTENCODING'] = 'WIN1252'
             
-            # Add client_encoding to handle PostgreSQL 17 encoding issues
+            # Try WIN1252 encoding first (for French.France.1252 database)
             conn_params = self.db_config.copy()
-            conn_params['client_encoding'] = 'UTF8'
+            conn_params['client_encoding'] = 'WIN1252'
             
             self.conn = psycopg2.connect(**conn_params)
+            self.conn.autocommit = False
             
-            # Set connection to autocommit temporarily to change encoding
-            old_autocommit = self.conn.autocommit
-            self.conn.autocommit = True
-            
-            try:
-                with self.conn.cursor() as cur:
-                    cur.execute("SET CLIENT_ENCODING TO 'UTF8'")
-            finally:
-                # Restore original autocommit setting
-                self.conn.autocommit = old_autocommit
-            
-            logger.info("Database connection established with UTF-8 encoding")
+            logger.info("Database connection established with WIN1252 encoding")
             
         except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            # Try alternative connection with LATIN1 encoding
+            logger.error(f"Failed to connect with WIN1252: {e}")
+            
+            # Try LATIN1 as fallback
             try:
                 logger.warning("Retrying connection with LATIN1 encoding...")
+                import os
+                os.environ['PGCLIENTENCODING'] = 'LATIN1'
+                
                 conn_params = self.db_config.copy()
                 conn_params['client_encoding'] = 'LATIN1'
                 self.conn = psycopg2.connect(**conn_params)
+                self.conn.autocommit = False
                 
-                # Set connection to autocommit temporarily to change encoding
-                self.conn.autocommit = True
-                
-                try:
-                    with self.conn.cursor() as cur:
-                        cur.execute("SET CLIENT_ENCODING TO 'UTF8'")
-                finally:
-                    self.conn.autocommit = False
-                
-                logger.info("Database connection established with LATIN1->UTF8 encoding")
+                logger.info("Database connection established with LATIN1 encoding")
                 
             except Exception as e2:
-                logger.error(f"Failed to connect with alternative encoding: {e2}")
-                raise
+                logger.error(f"Failed to connect with LATIN1: {e2}")
+                
+                # Last resort: let psycopg2 auto-detect
+                try:
+                    logger.warning("Retrying connection with auto-detection...")
+                    import os
+                    # Remove encoding override
+                    if 'PGCLIENTENCODING' in os.environ:
+                        del os.environ['PGCLIENTENCODING']
+                    
+                    conn_params = self.db_config.copy()
+                    # Don't specify client_encoding, let psycopg2 detect it
+                    if 'client_encoding' in conn_params:
+                        del conn_params['client_encoding']
+                        
+                    self.conn = psycopg2.connect(**conn_params)
+                    self.conn.autocommit = False
+                    
+                    logger.info("Database connection established with auto-detected encoding")
+                    
+                except Exception as e3:
+                    logger.error(f"Failed to connect with auto-detection: {e3}")
+                    raise
     
     def disconnect(self):
         """Close database connection"""
@@ -509,6 +564,9 @@ class MapMatcher:
         try:
             self.connect()
             
+            # Check and create required fields
+            self.check_and_create_image_fields()
+            
             # Execute all steps in sequence
             self.step1_update_seg_ss()
             self.step2_create_schema_and_projection_paire()
@@ -540,7 +598,7 @@ class MapMatcher:
             self.disconnect()
 
 
-def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0, database: str = 'cd08_demo'):
+def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_segment_length: float = 50.0, database: str = 'cd12_demo'):
     """Main function to run the map-matching program
     
     Args:
@@ -553,7 +611,7 @@ def main(perpendicular_iterations: int = 2, buffer_radius: float = 24.0, min_seg
     # Database configuration
     db_config = {
         'host': 'localhost',          # Update with your host
-        'database': database,         # Configurable database name
+        'database': 'cd12_demo',         # Configurable database name
         'user': 'diagway',           # Update with your username
         'password': 'diagway',       # Update with your password
         'port': 5433                  # Update with your port
@@ -602,21 +660,21 @@ if __name__ == "__main__":
     parser.add_argument(
         '-b', '--buffer-radius',
         type=float,
-        default=14.0,
+        default=24.0,
         help='Buffer radius in meters for segment matching'
     )
     
     parser.add_argument(
         '-s', '--min-segment-length',
         type=float,
-        default=20.0,
+        default=50.0,
         help='Minimum valid projected segment length in meters'
     )
     
     parser.add_argument(
         '-d', '--database',
         type=str,
-        default='rcp_pontarlier',
+        default='cd08_demo',
         help='Database name to connect to'
     )
     
