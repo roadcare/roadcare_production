@@ -572,8 +572,8 @@ def main():
         'database': 'CD93_2023',
         'user': 'diagway',
         'password': 'diagway',
-        'schema': 'offroad',  # Target schema
-        'source_folder': 'D:/Tmp/Offroad_cd93',  # Source folder
+        'schema': 'quantigo',  # Target schema
+        'source_folder': 'D:/Tmp/Offroad_cd93/quantigo_tag',  # Source folder
         'try_to_fusion': True  # Set to True to merge files with matching schemas
     }
 
