@@ -23,6 +23,11 @@ The system uses **linear referencing** to position images along road segments:
 ### Distance Threshold
 The `distance_threshold` parameter (default: 6 meters) defines how close images must be to be considered "at the same location" and compared for obsolescence.
 
+### Always More Recent Mode
+The `allways_more_recent` parameter (default: True) controls how images from different sessions are evaluated:
+- **True**: Always prefer the most recent image, marking older images as obsolete regardless of date difference
+- **False**: Use a more nuanced approach that considers both date difference (30-day threshold) and image quality (`note_globale`)
+
 ## Business Rules
 
 The tool applies sophisticated business rules to determine which images should be marked as obsolete:
@@ -46,8 +51,10 @@ When two images belong to different sessions AND are within `distance_threshold`
 - Mark images with `sens='+'` as obsolete
 
 **Same `sens`**:
-- **If capture dates differ by > 30 days**: Mark the older image as obsolete
-- **If capture dates differ by ≤ 30 days**: Mark the image with higher `note_globale` (worse quality) as obsolete
+- **If `allways_more_recent = True` (default)**: Always mark the older image as obsolete
+- **If `allways_more_recent = False`**:
+  - **If capture dates differ by > 30 days**: Mark the older image as obsolete
+  - **If capture dates differ by ≤ 30 days**: Mark the image with higher `note_globale` (worse quality) as obsolete
 
 ## Architecture
 
@@ -160,6 +167,32 @@ updater = ImageObsoleteUpdater(
 updater.process_all_axes_parallel()
 ```
 
+### Quality-Based Obsolescence Mode
+
+```python
+# Use quality-based approach instead of always preferring recent images
+# When images are within 30 days, choose based on quality (note_globale)
+updater = ImageObsoleteUpdater(
+    db_config=db_config,
+    allways_more_recent=False  # Enable quality-based evaluation
+)
+
+updater.process_all_axes_parallel()
+```
+
+### Combined Custom Settings
+
+```python
+# Combine distance threshold and obsolescence mode
+updater = ImageObsoleteUpdater(
+    db_config=db_config,
+    distance_threshold=8,
+    allways_more_recent=False
+)
+
+updater.process_all_axes_parallel()
+```
+
 ### Specific Routes Only
 
 ```python
@@ -180,7 +213,8 @@ updater.process_all_axes_parallel(axe_list=specific_routes)
 updater = ImageObsoleteUpdater(
     db_config=db_config,
     num_processes=4,
-    distance_threshold=6
+    distance_threshold=6,
+    allways_more_recent=True
 )
 
 updater.process_all_axes_parallel()
@@ -211,7 +245,8 @@ db_config = {
 updater = ImageObsoleteUpdater(
     db_config=db_config,
     num_processes=8,           # Use 8 parallel processes
-    distance_threshold=8       # Images within 8 meters are compared
+    distance_threshold=8,      # Images within 8 meters are compared
+    allways_more_recent=True   # Always prefer newer images (default)
 )
 
 # Option 1: Process all routes
@@ -248,6 +283,17 @@ Distance threshold in meters for comparing images:
   - Smaller values: More strict, fewer images marked obsolete
   - Larger values: More lenient, more images marked obsolete
 - **Typical range**: 4-10 meters depending on GPS accuracy and road geometry
+
+### `allways_more_recent` (bool, optional)
+Controls obsolescence behavior for images from different sessions:
+- **Default**: `True`
+- **Purpose**: Determines how to handle images captured at different times
+- **Impact**:
+  - `True`: Always prefer newer images, marking all older images as obsolete (simpler, more aggressive)
+  - `False`: Use date threshold (30 days) and quality score for more nuanced decisions
+- **Use case**: 
+  - Set to `True` for regular road monitoring where latest data is always preferred
+  - Set to `False` when image quality matters more than recency, or for quality control workflows
 
 ### `axe_list` (list, optional)
 List of specific route names to process:
@@ -468,6 +514,12 @@ For issues or questions:
 - Ensure all required fields are populated in `image` table
 
 ## Version History
+
+### v1.2.0
+- Added configurable `allways_more_recent` parameter
+- Updated Rule 2 to support both "always recent" and "quality-based" obsolescence modes
+- Enhanced flexibility for different use cases (monitoring vs. quality control)
+- Improved documentation with new usage examples
 
 ### v1.1.0
 - Added configurable `distance_threshold` parameter

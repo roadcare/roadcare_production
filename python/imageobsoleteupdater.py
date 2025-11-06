@@ -21,12 +21,12 @@ def process_axe_worker(args: Tuple) -> Set[str]:
     This runs in a separate process.
     
     Args:
-        args: Tuple of (axe_name, records_data, distance_threshold)
+        args: Tuple of (axe_name, records_data, distance_threshold, allways_more_recent)
         
     Returns:
         Set of IDs to mark as obsolete
     """
-    axe_name, records_data, distance_threshold = args
+    axe_name, records_data, distance_threshold, allways_more_recent = args
     
     if len(records_data) < 2:
         return set()
@@ -89,7 +89,7 @@ def process_axe_worker(args: Tuple) -> Set[str]:
         for j in candidate_indices:
             img2 = records[j]
             
-            obsolete_id = apply_business_rules_numpy(img1, img2)
+            obsolete_id = apply_business_rules_numpy(img1, img2, allways_more_recent)
             if obsolete_id:
                 ids_to_mark.add(obsolete_id)
     
@@ -97,9 +97,15 @@ def process_axe_worker(args: Tuple) -> Set[str]:
     return ids_to_mark
 
 
-def apply_business_rules_numpy(img1: np.void, img2: np.void) -> str:
+def apply_business_rules_numpy(img1: np.void, img2: np.void, allways_more_recent: bool = True) -> str:
     """
     Apply business rules using numpy record types.
+    
+    
+    Args:
+        img1: First image record
+        img2: Second image record
+        allways_more_recent: If True, always mark older image as obsolete for different sessions
     
     Returns the ID to mark as obsolete, or None if no action needed.
     """
@@ -156,29 +162,36 @@ def apply_business_rules_numpy(img1: np.void, img2: np.void) -> str:
             date2 = img2['captureDate']
             
             if not np.isnat(date1) and not np.isnat(date2):
-                # Calculate date difference in days
-                date_diff = abs((date1 - date2).astype('timedelta64[D]').astype(int))
-                
-                # If more than 30 days: mark older one
-                if date_diff > 30:
+                if allways_more_recent:
+                    # Always mark the older image as obsolete
                     if date1 < date2:
                         return img1['id']
                     else:
                         return img2['id']
-                # If <= 30 days: mark the one with higher note_globale
                 else:
-                    note1 = img1['note_globale']
-                    note2 = img2['note_globale']
-                    if note1 > note2:
-                        return img1['id']
-                    elif note2 > note1:
-                        return img2['id']
-    
+                    # Calculate date difference in days
+                    date_diff = abs((date1 - date2).astype('timedelta64[D]').astype(int))
+                    
+                    # If more than 30 days: mark older one
+                    if date_diff > 30:
+                        if date1 < date2:
+                            return img1['id']
+                        else:
+                            return img2['id']
+                    # If <= 30 days: mark the one with higher note_globale
+                    else:
+                        note1 = img1['note_globale']
+                        note2 = img2['note_globale']
+                        if note1 > note2:
+                            return img1['id']
+                        elif note2 > note1:
+                            return img2['id']
+
     return None
 
 
 class ImageObsoleteUpdater:
-    def __init__(self, db_config: dict, num_processes: int = None, distance_threshold: float = 6):
+    def __init__(self, db_config: dict, num_processes: int = None, distance_threshold: float = 6, allways_more_recent: bool = True):
         """
         Initialize the updater with database configuration.
         
@@ -186,13 +199,16 @@ class ImageObsoleteUpdater:
             db_config: Dictionary with keys: host, database, user, password, port
             num_processes: Number of processes to use (default: cpu_count())
             distance_threshold: Distance threshold for comparing images (default: 6)
+            allways_more_recent: Always mark older images as obsolete for different sessions (default: True)
         """
         self.db_config = db_config
         self.num_processes = num_processes or cpu_count()
         self.distance_threshold = distance_threshold
+        self.allways_more_recent = allways_more_recent
         self.has_primary_key = False
         logger.info(f"Using {self.num_processes} processes for parallel processing")
         logger.info(f"Distance threshold set to: {self.distance_threshold}")
+        logger.info(f"Allways more recent mode: {self.allways_more_recent}")
     
     def check_primary_key(self):
         """
@@ -448,7 +464,7 @@ class ImageObsoleteUpdater:
         
         # Step 2: Prepare work items for parallel processing
         logger.info("Step 2: Preparing parallel processing tasks...")
-        work_items = [(axe, records, self.distance_threshold) for axe, records in axe_data.items() if len(records) >= 2]
+        work_items = [(axe, records, self.distance_threshold, self.allways_more_recent) for axe, records in axe_data.items() if len(records) >= 2]
         logger.info(f"Processing {len(work_items)} axes in parallel...")
         
         # Step 3: Process in parallel using multiprocessing pool
@@ -490,8 +506,9 @@ def main():
     
     # Create updater instance with multiprocessing
     # Use None to auto-detect CPU count, or specify a number
-    updater = ImageObsoleteUpdater(db_config, num_processes=None)
-    
+    updater = ImageObsoleteUpdater(db_config, num_processes=None, distance_threshold=4, allways_more_recent=True)
+
+        
     # Process all axes in parallel
     logger.info("Starting obsolete flag update process with parallel processing...")
     
