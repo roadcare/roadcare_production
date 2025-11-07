@@ -1,6 +1,6 @@
 import psycopg2
 from psycopg2.extras import execute_batch
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 import sys
 
 class UnionFind:
@@ -39,25 +39,22 @@ class UnionFind:
         return result
 
 
-def calculate_distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Calculate Euclidean distance between two points"""
-    return ((x2 - x1)**2 + (y2 - y1)**2)**0.5
-
-
 def update_group_ids(
     host: str = "localhost",
     database: str = "your_database",
     user: str = "your_user",
     password: str = "your_password",
     port: int = 5432,
-    distance_threshold: float = 1.5
+    distance_threshold: float = 1.5,
+    excluded_codifications: List[str] = None
 ):
     """
     Update group_id for signalisation_h_intens table
     
     Rules:
     - Each is_linaire=true record gets unique group_id
-    - is_linaire=false records with same codification and within distance_threshold
+    - Records with codification in excluded_codifications list get unique group_id (not grouped)
+    - Other is_linaire=false records with same codification and ST_Distance(geom_center) < threshold
       are grouped together (transitive clustering)
     
     Args:
@@ -67,11 +64,20 @@ def update_group_ids(
         password: Database password
         port: Database port
         distance_threshold: Maximum distance (in meters) for grouping non-linear records
+        excluded_codifications: List of codifications that should NOT be grouped together
     """
+    
+    if excluded_codifications is None:
+        excluded_codifications = []
     
     print("=" * 60)
     print("Group ID Update Process")
     print("=" * 60)
+    
+    if excluded_codifications:
+        print(f"\nExcluded codifications (will NOT be grouped):")
+        for codif in excluded_codifications:
+            print(f"  - {codif}")
     
     # Connect to PostgreSQL
     try:
@@ -83,14 +89,25 @@ def update_group_ids(
             port=port
         )
         cur = conn.cursor()
-        print(f"✓ Connected to database: {database}")
+        print(f"\n✓ Connected to database: {database}")
     except Exception as e:
         print(f"✗ Failed to connect to database: {e}")
         sys.exit(1)
     
     try:
+        # Step 0: Reset all group_id to NULL
+        print("\n[Step 0/7] Resetting all group_id to NULL...")
+        cur.execute("""
+            UPDATE offroad.signalisation_h_intens
+            SET group_id = NULL
+        """)
+        rows_reset = cur.rowcount
+        print(f"  ✓ Reset {rows_reset} records")
+        
+        current_group_id = 1
+        
         # Step 1: Get all linear records (is_linaire = true)
-        print("\n[Step 1/5] Fetching linear records (is_linaire = true)...")
+        print("\n[Step 1/7] Fetching linear records (is_linaire = true)...")
         cur.execute("""
             SELECT id
             FROM offroad.signalisation_h_intens
@@ -102,84 +119,132 @@ def update_group_ids(
         
         # Assign unique group_id to each linear record
         linear_updates = []
-        for idx, (record_id,) in enumerate(linear_records, start=1):
-            linear_updates.append((idx, record_id))
+        for record_id, in linear_records:
+            linear_updates.append((current_group_id, record_id))
+            current_group_id += 1
         
-        # Step 2: Get all non-linear records with spatial data
-        print("\n[Step 2/5] Fetching non-linear records (is_linaire = false)...")
-        cur.execute("""
-            SELECT 
-                id,
-                codification,
-                ST_X(geom) as x,
-                ST_Y(geom) as y
-            FROM offroad.signalisation_h_intens
-            WHERE is_linaire = false
-                AND codification IS NOT NULL
-                AND geom IS NOT NULL
-        """)
+        # Step 2: Get non-linear records with excluded codifications
+        print("\n[Step 2/7] Fetching non-linear records with excluded codifications...")
+        if excluded_codifications:
+            cur.execute("""
+                SELECT id, codification
+                FROM offroad.signalisation_h_intens
+                WHERE is_linaire = false
+                    AND codification = ANY(%s)
+                ORDER BY id
+            """, (excluded_codifications,))
+            excluded_records = cur.fetchall()
+            print(f"  Found {len(excluded_records)} records with excluded codifications")
+            
+            # Assign unique group_id to each excluded record
+            excluded_updates = []
+            for record_id, codif in excluded_records:
+                excluded_updates.append((current_group_id, record_id))
+                current_group_id += 1
+        else:
+            excluded_records = []
+            excluded_updates = []
+            print(f"  No excluded codifications specified")
+        
+        # Step 3: Get all other non-linear records (to be grouped)
+        print("\n[Step 3/7] Fetching non-linear records for grouping...")
+        if excluded_codifications:
+            cur.execute("""
+                SELECT 
+                    id,
+                    codification
+                FROM offroad.signalisation_h_intens
+                WHERE is_linaire = false
+                    AND codification IS NOT NULL
+                    AND geom_center IS NOT NULL
+                    AND codification <> ALL(%s)
+            """, (excluded_codifications,))
+        else:
+            cur.execute("""
+                SELECT 
+                    id,
+                    codification
+                FROM offroad.signalisation_h_intens
+                WHERE is_linaire = false
+                    AND codification IS NOT NULL
+                    AND geom_center IS NOT NULL
+            """)
+        
         nonlinear_records = cur.fetchall()
-        print(f"  Found {len(nonlinear_records)} non-linear records")
+        print(f"  Found {len(nonlinear_records)} non-linear records to group")
         
         if not nonlinear_records:
             print("  No non-linear records to process")
             nonlinear_updates = []
         else:
-            # Step 3: Group by codification
-            print("\n[Step 3/5] Grouping by codification...")
-            by_codification: Dict[str, List[Tuple]] = {}
-            for record in nonlinear_records:
-                record_id, codif, x, y = record
+            # Step 4: Group by codification
+            print("\n[Step 4/7] Grouping by codification...")
+            by_codification: Dict[str, List[int]] = {}
+            for record_id, codif in nonlinear_records:
                 if codif not in by_codification:
                     by_codification[codif] = []
-                by_codification[codif].append((record_id, x, y))
+                by_codification[codif].append(record_id)
             
-            print(f"  Found {len(by_codification)} unique codifications")
+            print(f"  Found {len(by_codification)} unique codifications to group")
             
-            # Step 4: Find connected components using Union-Find
-            print("\n[Step 4/5] Finding connected components...")
+            # Step 5: Find connected components using Union-Find
+            print("\n[Step 5/7] Finding connected components...")
             print(f"  Distance threshold: {distance_threshold}m")
+            print(f"  Using ST_Distance on geom_center (LineString)")
             
             uf = UnionFind()
             total_connections = 0
             
             # For each codification group, find pairs within distance threshold
-            for codif, records in by_codification.items():
-                connections_in_group = 0
+            for codif, record_ids in by_codification.items():
+                if len(record_ids) <= 1:
+                    # No need to check distances for single records
+                    continue
                 
-                # Compare each pair within this codification
-                for i in range(len(records)):
-                    record_id1, x1, y1 = records[i]
-                    for j in range(i + 1, len(records)):
-                        record_id2, x2, y2 = records[j]
-                        
-                        # Calculate distance
-                        distance = calculate_distance(x1, y1, x2, y2)
-                        
-                        if distance < distance_threshold:
-                            uf.union(record_id1, record_id2)
-                            connections_in_group += 1
-                            total_connections += 1
+                print(f"    Processing '{codif}': {len(record_ids)} records...")
                 
-                if len(records) > 1:
-                    print(f"    '{codif}': {len(records)} records, {connections_in_group} connections")
+                # Find all pairs within distance threshold using PostgreSQL
+                cur.execute("""
+                    SELECT 
+                        t1.id as id1,
+                        t2.id as id2,
+                        ST_Distance(t1.geom_center, t2.geom_center) as distance
+                    FROM offroad.signalisation_h_intens t1
+                    JOIN offroad.signalisation_h_intens t2 ON t1.id < t2.id
+                    WHERE t1.id = ANY(%s)
+                        AND t2.id = ANY(%s)
+                        AND t1.is_linaire = false
+                        AND t2.is_linaire = false
+                        AND t1.codification = %s
+                        AND t2.codification = %s
+                        AND ST_Distance(t1.geom_center, t2.geom_center) < %s
+                """, (record_ids, record_ids, codif, codif, distance_threshold))
+                
+                pairs = cur.fetchall()
+                
+                # Add connections to Union-Find
+                for id1, id2, distance in pairs:
+                    uf.union(id1, id2)
+                    total_connections += 1
+                
+                if pairs:
+                    print(f"      Found {len(pairs)} connections")
             
             print(f"  Total connections found: {total_connections}")
             
             # Get group assignments for non-linear records
             groups = uf.get_groups()
-            unique_groups = len(set(groups.values()))
-            print(f"  Created {unique_groups} non-linear groups")
+            unique_groups = len(set(groups.values())) if groups else 0
+            print(f"  Created {unique_groups} clustered groups")
             
-            # Offset group_id to start after linear records
-            max_linear_group = len(linear_records)
+            # Assign group_ids starting after linear and excluded records
             nonlinear_updates = [
-                (group_id + max_linear_group, record_id) 
+                (group_id + current_group_id - 1, record_id) 
                 for record_id, group_id in groups.items()
             ]
         
-        # Step 5: Update database
-        print("\n[Step 5/5] Updating database...")
+        # Step 6: Update database
+        print("\n[Step 6/7] Updating database...")
         
         # Update linear records
         if linear_updates:
@@ -190,18 +255,28 @@ def update_group_ids(
             """, linear_updates, page_size=1000)
             print(f"  ✓ Updated {len(linear_updates)} linear records")
         
-        # Update non-linear records
+        # Update excluded records (not grouped)
+        if excluded_updates:
+            execute_batch(cur, """
+                UPDATE offroad.signalisation_h_intens
+                SET group_id = %s
+                WHERE id = %s
+            """, excluded_updates, page_size=1000)
+            print(f"  ✓ Updated {len(excluded_updates)} excluded records (not grouped)")
+        
+        # Update non-linear records (grouped)
         if nonlinear_updates:
             execute_batch(cur, """
                 UPDATE offroad.signalisation_h_intens
                 SET group_id = %s
                 WHERE id = %s
             """, nonlinear_updates, page_size=1000)
-            print(f"  ✓ Updated {len(nonlinear_updates)} non-linear records")
+            print(f"  ✓ Updated {len(nonlinear_updates)} non-linear records (grouped)")
         
-        # Commit changes
+        # Step 7: Commit changes
+        print("\n[Step 7/7] Committing changes...")
         conn.commit()
-        print("\n✓ Successfully committed all changes")
+        print("  ✓ Successfully committed all changes")
         
         # Show summary statistics
         print("\n" + "=" * 60)
@@ -223,8 +298,24 @@ def update_group_ids(
         print(f"Records with group_id:     {stats[0] - stats[4]}")
         print(f"Records without group_id:  {stats[4]}")
         print(f"Total unique groups:       {stats[1]}")
-        print(f"  - Linear groups:         {stats[2]}")
-        print(f"  - Non-linear groups:     {stats[1] - stats[2] if stats[1] else 0}")
+        print(f"  - Linear records:        {len(linear_updates)}")
+        print(f"  - Excluded (not grouped):{len(excluded_updates)}")
+        print(f"  - Clustered groups:      {stats[1] - len(linear_updates) - len(excluded_updates) if stats[1] else 0}")
+        
+        # Show excluded codifications summary
+        if excluded_codifications:
+            print("\n" + "=" * 60)
+            print("Excluded Codifications Summary")
+            print("=" * 60)
+            
+            for codif in excluded_codifications:
+                cur.execute("""
+                    SELECT COUNT(*) 
+                    FROM offroad.signalisation_h_intens
+                    WHERE codification = %s AND group_id IS NOT NULL
+                """, (codif,))
+                count = cur.fetchone()[0]
+                print(f"  '{codif}': {count} records (each with unique group_id)")
         
         # Show some examples
         print("\n" + "=" * 60)
@@ -249,9 +340,54 @@ def update_group_ids(
             print(f"{'Group ID':<12} {'Count':<8} {'Type':<15} {'Codifications'}")
             print("-" * 60)
             for group_id, count, all_linear, codifs in examples:
-                group_type = "Linear" if all_linear else "Non-linear"
+                if all_linear:
+                    group_type = "Linear"
+                elif count == 1:
+                    group_type = "Not grouped"
+                else:
+                    group_type = "Clustered"
                 codif_str = ", ".join([c for c in codifs if c]) if codifs else "None"
                 print(f"{group_id:<12} {count:<8} {group_type:<15} {codif_str[:30]}")
+        
+        # Show distribution of group sizes
+        print("\n" + "=" * 60)
+        print("Group Size Distribution")
+        print("=" * 60)
+        
+        cur.execute("""
+            SELECT 
+                CASE 
+                    WHEN count = 1 THEN '1 record'
+                    WHEN count = 2 THEN '2 records'
+                    WHEN count BETWEEN 3 AND 5 THEN '3-5 records'
+                    WHEN count BETWEEN 6 AND 10 THEN '6-10 records'
+                    ELSE '10+ records'
+                END as size_range,
+                COUNT(*) as num_groups,
+                SUM(count) as total_records
+            FROM (
+                SELECT group_id, COUNT(*) as count
+                FROM offroad.signalisation_h_intens
+                WHERE group_id IS NOT NULL
+                GROUP BY group_id
+            ) subq
+            GROUP BY 
+                CASE 
+                    WHEN count = 1 THEN '1 record'
+                    WHEN count = 2 THEN '2 records'
+                    WHEN count BETWEEN 3 AND 5 THEN '3-5 records'
+                    WHEN count BETWEEN 6 AND 10 THEN '6-10 records'
+                    ELSE '10+ records'
+                END
+            ORDER BY MIN(count)
+        """)
+        
+        distribution = cur.fetchall()
+        if distribution:
+            print(f"{'Size Range':<15} {'# Groups':<12} {'Total Records'}")
+            print("-" * 60)
+            for size_range, num_groups, total_records in distribution:
+                print(f"{size_range:<15} {num_groups:<12} {total_records}")
         
         print("\n✓ Process completed successfully!")
         
@@ -259,6 +395,8 @@ def update_group_ids(
         conn.rollback()
         print(f"\n✗ Error occurred: {e}")
         print("  All changes have been rolled back")
+        import traceback
+        traceback.print_exc()
         raise
     
     finally:
@@ -271,11 +409,15 @@ if __name__ == "__main__":
     # Configure your database connection parameters
     DB_CONFIG = {
         "host": "localhost",
-        "database": "CD93_2023",
+        "database": 'CD93_2023',
         "user": "diagway",
         "password": "diagway",
         "port": 5433,
-        "distance_threshold": 0.7  # Distance in meters
+        "distance_threshold": 1.5,  # Distance in meters
+        
+        # List of codifications that should NOT be grouped
+        # Each record with these codifications will get a unique group_id
+        "excluded_codifications": [ "PIC_VELO"]
     }
     
     # Run the update
