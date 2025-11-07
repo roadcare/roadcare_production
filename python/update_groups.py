@@ -8,6 +8,11 @@ class UnionFind:
     def __init__(self):
         self.parent = {}
     
+    def add(self, x):
+        """Add an element to the structure"""
+        if x not in self.parent:
+            self.parent[x] = x
+    
     def find(self, x):
         """Find root of element x with path compression"""
         if x not in self.parent:
@@ -46,7 +51,8 @@ def update_group_ids(
     password: str = "your_password",
     port: int = 5432,
     distance_threshold: float = 1.5,
-    excluded_codifications: List[str] = None
+    excluded_codifications: List[str] = None,
+    codification_thresholds: Dict[str, float] = None
 ):
     """
     Update group_id for signalisation_h_intens table
@@ -56,6 +62,7 @@ def update_group_ids(
     - Records with codification in excluded_codifications list get unique group_id (not grouped)
     - Other is_linaire=false records with same codification and ST_Distance(geom_center) < threshold
       are grouped together (transitive clustering)
+    - All records must have a group_id (not null)
     
     Args:
         host: Database host
@@ -63,16 +70,27 @@ def update_group_ids(
         user: Database user
         password: Database password
         port: Database port
-        distance_threshold: Maximum distance (in meters) for grouping non-linear records
+        distance_threshold: Default maximum distance (in meters) for grouping non-linear records
         excluded_codifications: List of codifications that should NOT be grouped together
+        codification_thresholds: Dict of codification -> specific distance threshold
+                                 Example: {'ZEBRA': 3.5, 'B14': 2.0}
     """
     
     if excluded_codifications is None:
         excluded_codifications = []
     
+    if codification_thresholds is None:
+        codification_thresholds = {}
+    
     print("=" * 60)
     print("Group ID Update Process")
     print("=" * 60)
+    print(f"\nDefault distance threshold: {distance_threshold}m")
+    
+    if codification_thresholds:
+        print(f"\nSpecific thresholds by codification:")
+        for codif, threshold in codification_thresholds.items():
+            print(f"  - '{codif}': {threshold}m")
     
     if excluded_codifications:
         print(f"\nExcluded codifications (will NOT be grouped):")
@@ -155,9 +173,7 @@ def update_group_ids(
                     codification
                 FROM offroad.signalisation_h_intens
                 WHERE is_linaire = false
-                    AND codification IS NOT NULL
-                    AND geom_center IS NOT NULL
-                    AND codification <> ALL(%s)
+                    AND (codification IS NULL OR codification <> ALL(%s))
             """, (excluded_codifications,))
         else:
             cur.execute("""
@@ -166,12 +182,10 @@ def update_group_ids(
                     codification
                 FROM offroad.signalisation_h_intens
                 WHERE is_linaire = false
-                    AND codification IS NOT NULL
-                    AND geom_center IS NOT NULL
             """)
         
         nonlinear_records = cur.fetchall()
-        print(f"  Found {len(nonlinear_records)} non-linear records to group")
+        print(f"  Found {len(nonlinear_records)} non-linear records to process")
         
         if not nonlinear_records:
             print("  No non-linear records to process")
@@ -180,28 +194,44 @@ def update_group_ids(
             # Step 4: Group by codification
             print("\n[Step 4/7] Grouping by codification...")
             by_codification: Dict[str, List[int]] = {}
-            for record_id, codif in nonlinear_records:
-                if codif not in by_codification:
-                    by_codification[codif] = []
-                by_codification[codif].append(record_id)
+            records_with_null_codif = []
             
-            print(f"  Found {len(by_codification)} unique codifications to group")
+            for record_id, codif in nonlinear_records:
+                if codif is None:
+                    records_with_null_codif.append(record_id)
+                else:
+                    if codif not in by_codification:
+                        by_codification[codif] = []
+                    by_codification[codif].append(record_id)
+            
+            print(f"  Found {len(by_codification)} unique codifications")
+            if records_with_null_codif:
+                print(f"  Found {len(records_with_null_codif)} records with NULL codification")
             
             # Step 5: Find connected components using Union-Find
             print("\n[Step 5/7] Finding connected components...")
-            print(f"  Distance threshold: {distance_threshold}m")
-            print(f"  Using ST_Distance on geom_center (LineString)")
+            print(f"  Using ST_Distance on geom_center (Point)")
             
             uf = UnionFind()
+            
+            # IMPORTANT: Add ALL non-linear records to Union-Find first
+            # This ensures even isolated records get a group_id
+            print("  Initializing all records in Union-Find...")
+            for record_id, codif in nonlinear_records:
+                uf.add(record_id)
+            
             total_connections = 0
             
             # For each codification group, find pairs within distance threshold
             for codif, record_ids in by_codification.items():
                 if len(record_ids) <= 1:
-                    # No need to check distances for single records
+                    # Single records are already initialized, no connections needed
                     continue
                 
-                print(f"    Processing '{codif}': {len(record_ids)} records...")
+                # Get threshold for this codification (specific or default)
+                threshold = codification_thresholds.get(codif, distance_threshold)
+                
+                print(f"    Processing '{codif}': {len(record_ids)} records (threshold: {threshold}m)...")
                 
                 # Find all pairs within distance threshold using PostgreSQL
                 cur.execute("""
@@ -217,8 +247,10 @@ def update_group_ids(
                         AND t2.is_linaire = false
                         AND t1.codification = %s
                         AND t2.codification = %s
+                        AND t1.geom_center IS NOT NULL
+                        AND t2.geom_center IS NOT NULL
                         AND ST_Distance(t1.geom_center, t2.geom_center) < %s
-                """, (record_ids, record_ids, codif, codif, distance_threshold))
+                """, (record_ids, record_ids, codif, codif, threshold))
                 
                 pairs = cur.fetchall()
                 
@@ -232,16 +264,25 @@ def update_group_ids(
             
             print(f"  Total connections found: {total_connections}")
             
-            # Get group assignments for non-linear records
+            # Get group assignments for ALL non-linear records
             groups = uf.get_groups()
             unique_groups = len(set(groups.values())) if groups else 0
-            print(f"  Created {unique_groups} clustered groups")
+            print(f"  Created {unique_groups} groups (including isolated records)")
             
             # Assign group_ids starting after linear and excluded records
             nonlinear_updates = [
                 (group_id + current_group_id - 1, record_id) 
                 for record_id, group_id in groups.items()
             ]
+            
+            # Verify all non-linear records have been assigned
+            assigned_ids = set(record_id for _, record_id in nonlinear_updates)
+            all_ids = set(record_id for record_id, _ in nonlinear_records)
+            missing_ids = all_ids - assigned_ids
+            
+            if missing_ids:
+                print(f"  ⚠ Warning: {len(missing_ids)} records were not assigned a group_id")
+                print(f"    Missing IDs: {list(missing_ids)[:10]}...")
         
         # Step 6: Update database
         print("\n[Step 6/7] Updating database...")
@@ -278,6 +319,35 @@ def update_group_ids(
         conn.commit()
         print("  ✓ Successfully committed all changes")
         
+        # Verify no NULL group_id remains
+        print("\n[Verification] Checking for NULL group_id...")
+        cur.execute("""
+            SELECT COUNT(*) 
+            FROM offroad.signalisation_h_intens
+            WHERE group_id IS NULL
+        """)
+        null_count = cur.fetchone()[0]
+        
+        if null_count > 0:
+            print(f"  ⚠ WARNING: {null_count} records still have NULL group_id!")
+            
+            # Show details of records with NULL group_id
+            cur.execute("""
+                SELECT id, is_linaire, codification, 
+                       geom_center IS NOT NULL as has_geom_center
+                FROM offroad.signalisation_h_intens
+                WHERE group_id IS NULL
+                LIMIT 10
+            """)
+            null_records = cur.fetchall()
+            print("\n  Sample of records with NULL group_id:")
+            print(f"  {'ID':<10} {'is_linaire':<12} {'Codification':<20} {'Has geom_center'}")
+            print("  " + "-" * 60)
+            for rec_id, is_lin, codif, has_geom in null_records:
+                print(f"  {rec_id:<10} {str(is_lin):<12} {codif or 'NULL':<20} {has_geom}")
+        else:
+            print(f"  ✓ All records have a group_id assigned")
+        
         # Show summary statistics
         print("\n" + "=" * 60)
         print("Summary Statistics")
@@ -300,7 +370,29 @@ def update_group_ids(
         print(f"Total unique groups:       {stats[1]}")
         print(f"  - Linear records:        {len(linear_updates)}")
         print(f"  - Excluded (not grouped):{len(excluded_updates)}")
-        print(f"  - Clustered groups:      {stats[1] - len(linear_updates) - len(excluded_updates) if stats[1] else 0}")
+        print(f"  - Other groups:          {stats[1] - len(linear_updates) - len(excluded_updates) if stats[1] else 0}")
+        
+        # Show specific codification thresholds summary
+        if codification_thresholds:
+            print("\n" + "=" * 60)
+            print("Codifications with Specific Thresholds")
+            print("=" * 60)
+            
+            for codif, threshold in codification_thresholds.items():
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(DISTINCT group_id) as num_groups
+                    FROM offroad.signalisation_h_intens
+                    WHERE codification = %s AND group_id IS NOT NULL
+                """, (codif,))
+                result = cur.fetchone()
+                if result[0] > 0:
+                    avg_per_group = result[0] / result[1] if result[1] > 0 else 0
+                    print(f"  '{codif}' (threshold: {threshold}m):")
+                    print(f"    - Total records: {result[0]}")
+                    print(f"    - Number of groups: {result[1]}")
+                    print(f"    - Avg records/group: {avg_per_group:.1f}")
         
         # Show excluded codifications summary
         if excluded_codifications:
@@ -343,7 +435,7 @@ def update_group_ids(
                 if all_linear:
                     group_type = "Linear"
                 elif count == 1:
-                    group_type = "Not grouped"
+                    group_type = "Isolated"
                 else:
                     group_type = "Clustered"
                 codif_str = ", ".join([c for c in codifs if c]) if codifs else "None"
@@ -413,11 +505,20 @@ if __name__ == "__main__":
         "user": "diagway",
         "password": "diagway",
         "port": 5433,
-        "distance_threshold": 1.5,  # Distance in meters
+        "distance_threshold": 1.5,  # Default distance in meters
         
         # List of codifications that should NOT be grouped
         # Each record with these codifications will get a unique group_id
-        "excluded_codifications": [ "PIC_VELO"]
+       	"excluded_codifications": [ "PIC_VELO", 'FD_D','FD_G','FD_TD','FD_TD','FD','FR_D','FR_G'],
+        
+        # Dictionary of codifications with specific distance thresholds
+        # Format: "codification": distance_in_meters
+        "codification_thresholds": {
+            # Example: ZEBRA crossings might need a larger distance threshold
+            "ZEBRA": 3.5
+            # "PASSAGE_PIETON": 3.0,
+            # "STOP": 2.0,
+        }
     }
     
     # Run the update
