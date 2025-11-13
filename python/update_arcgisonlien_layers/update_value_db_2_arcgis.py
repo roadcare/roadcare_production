@@ -445,6 +445,6 @@ if __name__ == "__main__":
         table_name='zh_u02_l200',
         schema='rendu',
         id_field='id',
-        fields_to_update='note_classe',
+        fields_to_update=['code_unique', 'priorite','entretien','entretien_prix_surf','ag_largeur','surface'],
         batch_size=1000
     )
